@@ -3,14 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"remnant-save-edit/config"
 	"remnant-save-edit/remnant"
 	"strconv"
+	"strings"
 )
 
 // -- Types
@@ -30,6 +31,45 @@ type FName struct {
 	Index  uint16
 	Number int32
 }
+
+type ArrayProperty struct {
+	Count       int32
+	Items       []interface{}
+	ElementType string
+}
+
+type StructPropertyField struct {
+	Name  string
+	Type  string
+	Value interface{}
+}
+type StructProperty map[string]StructPropertyField
+type StructArrayProperty struct {
+	Type   string
+	Values []StructProperty
+}
+
+type EnumProperty struct {
+	EnumType  string
+	EnumValue string
+}
+
+type TextProperty struct {
+	GUID []byte
+	Text string
+}
+
+type MapPropertyValue struct {
+	Key   interface{}
+	Value interface{}
+}
+type MapProperty struct {
+	KeyType   string
+	ValueType string
+	Values    []MapPropertyValue
+}
+
+type ObjectProperty UObject
 
 // -- Globals
 
@@ -52,7 +92,7 @@ func readInt[T Int](r io.Reader) (T, error) {
 	return value, nil
 }
 
-// -- Rean UE specific types
+// -- Read UE specific types
 
 func readFString(r io.Reader) (string, error) {
 	stringSize, err := readInt[int32](r)
@@ -67,7 +107,7 @@ func readFString(r io.Reader) (string, error) {
 	return string(stringData[:stringSize-1]), nil
 }
 
-func readFName(r io.Reader, names []string) (FName, error) {
+func readFName(r io.Reader) (FName, error) {
 	var index uint16
 	err := binary.Read(r, binary.LittleEndian, &index)
 	if err != nil {
@@ -112,27 +152,39 @@ func readSaveGameClassPath(r io.Reader) (FSaveGameClassPath, error) {
 	return saveGameClassPath, nil
 }
 
-func readArchetype(r io.Reader) (string, error) {
-	stringHeader := make([]byte, 13)
-	_, err := r.Read(stringHeader)
-	if err != nil {
-		return "", err
+func readIntProperty(r io.ReadSeeker, raw bool) (int32, error) {
+	if !raw {
+		// 1 unknown byte?
+		_, err := r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return 0, err
+		}
 	}
-	if stringHeader[2] != 0xC {
-		return "", errors.New("invalid string header")
+
+	// is it always int32?
+	var varData int32
+	err := binary.Read(r, binary.LittleEndian, &varData)
+	if err != nil {
+		return 0, err
+	}
+
+	return varData, nil
+}
+
+func readSoftObjectProperty(r io.ReadSeeker, raw bool) (string, error) {
+	if !raw {
+		_, err := r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	return readFString(r)
 }
 
-func readBoolProperty(r *bytes.Reader) (bool, error) {
-	stringHeader := make([]byte, 12)
-	_, err := r.Read(stringHeader)
-	if err != nil {
-		return false, err
-	}
-	var value uint8
-	err = binary.Read(r, binary.LittleEndian, &value)
+func readBoolProperty(r io.ReadSeeker) (bool, error) {
+	varData := make([]byte, 1)
+	err := binary.Read(r, binary.LittleEndian, &varData)
 	if err != nil {
 		return false, err
 	}
@@ -140,369 +192,570 @@ func readBoolProperty(r *bytes.Reader) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
-	return value == 1, nil
+	return varData[0] == 1, nil
 }
 
-func readIntProperty(r *bytes.Reader, varSize int32) ([]byte, error) {
-	varData := make([]byte, varSize)
-	_, err := r.Seek(5, io.SeekCurrent)
+func readEnumProperty(r io.ReadSeeker) (EnumProperty, error) {
+	enumTypeIndex, err := readInt[int16](r)
 	if err != nil {
-		return nil, err
+		return EnumProperty{}, err
+	}
+	enumType := names[enumTypeIndex]
+
+	_, err = r.Seek(1, io.SeekCurrent)
+	if err != nil {
+		return EnumProperty{}, err
 	}
 
-	err = binary.Read(r, binary.LittleEndian, &varData)
+	// is it always 2 bytes
+	enumValueIndex, err := readInt[int16](r)
 	if err != nil {
-		return nil, err
+		return EnumProperty{}, err
 	}
+	enumValue := names[enumValueIndex]
 
-	return varData, nil
+	return EnumProperty{
+		EnumType:  enumType,
+		EnumValue: enumValue,
+	}, nil
 }
 
-func readSoftObjectProperty(r *bytes.Reader, varSize int32) (string, error) {
-	_, err := r.Seek(5, io.SeekCurrent)
+func readMapProperty(r io.ReadSeeker) (MapProperty, error) {
+	result := MapProperty{}
+
+	keyIndex, err := readInt[int16](r)
+	if err != nil {
+		return result, err
+	}
+	result.KeyType = names[keyIndex]
+
+	valueIndex, err := readInt[int16](r)
+	if err != nil {
+		return result, err
+	}
+	result.ValueType = names[valueIndex]
+
+	_, err = r.Seek(5, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	mapLength, err := readInt[int32](r)
+	if err != nil {
+		return result, err
+	}
+
+	values := make([]MapPropertyValue, mapLength)
+	for i := 0; i < int(mapLength); i++ {
+		// -- something is off here, because map does not contain variable size, it is key:value pairs one after another
+		key, err := readProperty(r, result.KeyType, 0, true)
+		if err != nil {
+			return result, err
+		}
+		value, err := readProperty(r, result.ValueType, 0, true)
+		if err != nil {
+			return result, err
+		}
+
+		values[i] = struct{ Key, Value interface{} }{key, value}
+	}
+	result.Values = values
+
+	return result, nil
+}
+
+func readStrProperty(r io.ReadSeeker, raw bool) (string, error) {
+	if !raw {
+		// unknown 1 byte
+		_, err := r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	strLength, err := readInt[int32](r)
 	if err != nil {
 		return "", err
 	}
 
-	varData, err := readFString(r)
+	if strLength == 0 {
+		return "", nil
+	}
+	strData := make([]byte, strLength)
+	_, err = r.Read(strData)
+	if err != nil {
+		return "", err
+	}
 
-	return varData, nil
+	return string(strData), nil
 }
 
-func readProperty(r *bytes.Reader, varType string, varSize int32) (interface{}, error) {
-	// 0x1 = IntProperty
-	if varType == "IntProperty" {
-		varData, err := readIntProperty(r, varSize)
+func readNameProperty(r io.ReadSeeker, raw bool) (string, error) {
+	if !raw {
+		// unknown 1 byte
+		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
-		return varData, nil
-	}
-	// 0xC = SoftObjectProperty
-	if varType == "SoftObjectProperty" {
-		varData, err := readSoftObjectProperty(r, varSize)
-		if err != nil {
-			return nil, err
-		}
-		return varData, nil
-	}
-	// 0x7 = BoolProperty
-	if varType == "BoolProperty" {
-		_, err := r.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-		varData := make([]byte, 1)
-		err = binary.Read(r, binary.LittleEndian, &varData)
-		if err != nil {
-			return nil, err
-		}
-		_, err = r.Seek(1, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-		return varData[0] == 1, nil
-	}
-	// 0x3 = ArrayProperty
-	if varType == "ArrayProperty" {
-		_, err := r.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		// elementType is stringIndex of type
-		elementTypeIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		elementType := names[elementTypeIndex]
-
-		_, err = r.Seek(1, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		// arrayLength, err := readInt[int32](r)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		// fmt.Println("array", elementType, arrayLength)
-		// TODO: read each element based on elementType
-		_, err = r.Seek(int64(varSize), io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		return map[string]interface{}{
-			"elementType": elementType,
-		}, nil
-
-		// for i := 0; i < int(arrayLength); i++ {
-		// 	_, err := readProperty(r, elementTypeIndex, varSize)
-		// 	if err != nil {
-		// 		return nil, err
-		// 	}
-		// }
-	}
-	// 0x11 = StructProperty
-	if varType == "StructProperty" {
-		// 10 00 - unknown
-		// 11 00 - maybe stringIndex of StructProperty
-		_, err := r.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		propertyTypeIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		propertyType := names[propertyTypeIndex]
-
-		// 15 bytes, not sure what they are
-		_, err = r.Seek(17, io.SeekCurrent)
-
-		_, err = r.Seek(int64(varSize), io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		// _, err = r.Seek(17, io.SeekCurrent)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		// structSize, err := readInt[int32](r)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		// _, err = r.Seek(4, io.SeekCurrent)
-		// if err != nil {
-		// 	return nil, err
-		// }
-		// _, err = r.Seek(int64(structSize), io.SeekCurrent)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		return propertyType, nil
-	}
-	// 0x47 = EnumProperty
-	if varType == "EnumProperty" {
-		_, err := r.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-		enumTypeIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		enumType := names[enumTypeIndex]
-
-		_, err = r.Seek(1, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		varData := make([]byte, varSize)
-		enumValueIndex, err := r.Read(varData)
-		if err != nil {
-			return nil, err
-		}
-		enumValue := names[int16(enumValueIndex)]
-
-		return map[string]interface{}{
-			"enumType":  enumType,
-			"enumValue": enumValue,
-		}, nil
-	}
-	// 0xC4 = MapProperty
-	if varType == "MapProperty" {
-		_, err := r.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-		keyIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		keyType := names[keyIndex]
-
-		valueIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		valueType := names[valueIndex]
-
-		_, err = r.Seek(1, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		_, err = r.Seek(int64(varSize), io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		// // unknown 5 bytes
-		// _, err = r.Seek(5, io.SeekCurrent)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		// mapLength, err := readInt[int32](r)
-		// if err != nil {
-		// 	return nil, err
-		// }
-
-		// for i := 0; i < int(mapLength); i++ {
-		// -- something is off here, because map does not contain variable size, it is key:value pairs one after another
-		// 	key, err := readProperty(r, keyType, keySize)
-		// 	value, err := readProperty(r, valueIndex, valueSize)
-		// }
-		return map[string]interface{}{
-			"keyType":   keyType,
-			"valueType": valueType,
-		}, nil
-	}
-	if varType == "NameProperty" {
-		nameIndex, err := readInt[int16](r)
-		if err != nil {
-			return nil, err
-		}
-		name := names[nameIndex]
-
-		return name, nil
-	}
-	if varType == "StrProperty" {
-		_, err := r.Seek(5, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		strLength, err := readInt[int32](r)
-		if err != nil {
-			return nil, err
-		}
-
-		strData := make([]byte, strLength)
-		_, err = r.Read(strData)
-		if err != nil {
-			return nil, err
-		}
-
-		return string(strData), nil
 	}
 
-	varData := make([]byte, varSize)
-
-	_, err := r.Seek(5, io.SeekCurrent)
+	nameIndex, err := readInt[int16](r)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	name := names[nameIndex]
 
-	err = binary.Read(r, binary.LittleEndian, &varData)
-	if err != nil {
-		return nil, err
-	}
-
-	return varData, nil
+	return name, nil
 }
 
-func readUSavedCharacter(r *bytes.Reader, objectStart int64, maxLength int64) error {
-	variables := map[string]struct {
-		varType string
-		varData interface{}
-	}{}
-
-	for {
-		stringIndex, err := readInt[int16](r)
+func readFloatProperty(r io.ReadSeeker, raw bool) (float32, error) {
+	if !raw {
+		// unknown 1 byte
+		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			} else {
-				return err
-			}
+			return 0, err
 		}
+	}
 
-		if names[stringIndex] == "None" {
-			_, err = r.Seek(4, io.SeekCurrent)
+	// is it always float32?
+	var floatData float32
+	err := binary.Read(r, binary.LittleEndian, &floatData)
+	if err != nil {
+		return 0, err
+	}
+
+	return floatData, nil
+}
+
+func readUInt64Property(r io.ReadSeeker, raw bool) (uint64, error) {
+	if !raw {
+		// unknown 1 byte
+		_, err := r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	var uint64Data uint64
+	err := binary.Read(r, binary.LittleEndian, &uint64Data)
+	if err != nil {
+		return 0, err
+	}
+
+	return uint64Data, nil
+}
+
+func readTextProperty(r io.ReadSeeker) (TextProperty, error) {
+	// 10 unknown bytes
+	_, err := r.Seek(10, io.SeekCurrent)
+	if err != nil {
+		return TextProperty{}, err
+	}
+
+	guidLength, err := readInt[int32](r)
+	if err != nil {
+		return TextProperty{}, err
+	}
+
+	// it is string, but I'm not sure where it's used, so read it as bytes
+	guidData := make([]byte, guidLength)
+	_, err = r.Read(guidData)
+	if err != nil {
+		return TextProperty{}, err
+	}
+
+	textLength, err := readInt[int32](r)
+	if err != nil {
+		return TextProperty{}, err
+	}
+
+	textData := make([]byte, textLength)
+	_, err = r.Read(textData)
+	if err != nil {
+		return TextProperty{}, err
+	}
+
+	return TextProperty{Text: string(textData), GUID: guidData}, nil
+}
+
+func readObjectProperty(r io.ReadSeeker, raw bool) (ObjectProperty, error) {
+	if !raw {
+		// unknown 1 byte
+		_, err := r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return ObjectProperty{}, err
+		}
+	}
+
+	// I think for ObjectProperty objectIndex is 4bytes
+	// but I'd like to keep it consistent with other properties
+	objectIndex, err := readInt[int16](r)
+	if err != nil {
+		return ObjectProperty{}, err
+	}
+	_, err = r.Seek(2, io.SeekCurrent)
+	if err != nil {
+		return ObjectProperty{}, err
+	}
+
+	if objectIndex == -1 {
+		// no object
+		return ObjectProperty{}, nil
+	}
+
+	return ObjectProperty(objects[objectIndex]), nil
+}
+
+func readByteProperty(r io.Seeker) (byte, error) {
+	// not sure why is it 8 bytes
+	// i don't know what to return here
+	// returning 0 for now
+	_, err := r.Seek(4, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+
+	return 0, nil
+}
+
+func readStructArrayProperty(r io.ReadSeeker, arrayLength int32) (StructArrayProperty, error) {
+	result := StructArrayProperty{}
+
+	// skip first 2 bytes - variable name again
+	_, err := r.Seek(2, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	// skip 2 more bytes - type again (StructProperty)
+	_, err = r.Seek(2, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	// skip 4 bytes (array size in bytes)
+	_, err = r.Seek(4, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	// 4 unknown bytes
+	_, err = r.Seek(4, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	innerTypeIndex, err := readInt[int16](r)
+	if err != nil {
+		return result, err
+	}
+	result.Type = names[innerTypeIndex]
+
+	_, err = r.Seek(17, io.SeekCurrent)
+	if err != nil {
+		return result, err
+	}
+
+	values := make([]StructProperty, arrayLength)
+	for i := 0; i < int(arrayLength); i++ {
+		arrayElement := StructProperty{}
+		for {
+			variableNameIndex, err := readInt[int16](r)
 			if err != nil {
-				return err
+				return result, err
 			}
-		} else {
+			variableName := names[variableNameIndex]
+
+			if variableName == "None" {
+				// end of struct
+				break
+			}
+
 			varTypeIndex, err := readInt[int16](r)
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				} else {
-					return err
-				}
+				return result, err
 			}
 			varType := names[varTypeIndex]
 
 			varSize, err := readInt[int32](r)
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				} else {
-					return err
-				}
+				return result, err
 			}
 
-			varData, err := readProperty(r, varType, varSize)
+			_, err = r.Seek(4, io.SeekCurrent)
+			if err != nil {
+				return result, err
+			}
+
+			value, err := readProperty(r, varType, varSize, false)
+			if err != nil {
+				return result, err
+			}
+
+			arrayElement[variableName] = StructPropertyField{
+				Name:  variableName,
+				Type:  varType,
+				Value: value,
+			}
+		}
+		values[i] = arrayElement
+	}
+
+	result.Values = values
+
+	return result, nil
+}
+
+func readPersistenceBlob(r io.ReadSeeker, varSize int32) (interface{}, error) {
+	_, err := r.Seek(12, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+
+	namesOffset, err := readInt[int32](r)
+	if err != nil {
+		return nil, err
+	}
+
+	currentPos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = r.Seek(int64(namesOffset+4), io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	namesCount, err := readInt[int32](r)
+	if err != nil {
+		return nil, err
+	}
+
+	persistenceNames := make([]string, namesCount)
+	for i := 0; i < int(namesCount); i++ {
+		persistenceNames[i], err = readFString(r)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	_, err = r.Seek(currentPos, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	return fmt.Sprintf("%s with size %d", "PersistenceBlob", varSize), nil
+}
+
+func readProperty(r io.ReadSeeker, varType string, varSize int32, raw bool) (interface{}, error) {
+	switch varType {
+	case "IntProperty":
+		{
+			return readIntProperty(r, raw)
+		}
+	case "SoftObjectProperty":
+		{
+			return readSoftObjectProperty(r, raw)
+		}
+	case "BoolProperty":
+		{
+			return readBoolProperty(r)
+		}
+	case "MapProperty":
+		{
+			return readMapProperty(r)
+		}
+	case "EnumProperty":
+		{
+			return readEnumProperty(r)
+		}
+	case "StrProperty":
+		{
+			return readStrProperty(r, raw)
+		}
+	case "TextProperty":
+		{
+			return readTextProperty(r)
+		}
+	case "UInt64Property":
+		{
+			return readUInt64Property(r, raw)
+		}
+	case "FloatProperty":
+		{
+			return readFloatProperty(r, raw)
+		}
+	case "NameProperty":
+		{
+			return readNameProperty(r, raw)
+		}
+
+	case "ArrayProperty":
+		{
+			elementPropertyTypeIndex, err := readInt[int16](r)
+			if err != nil {
+				return nil, err
+			}
+			elementPropertyType := names[elementPropertyTypeIndex]
+
+			_, err = r.Seek(1, io.SeekCurrent)
+			if err != nil {
+				return nil, err
+			}
+
+			arrayLength, err := readInt[int32](r)
+			if err != nil {
+				return nil, err
+			}
+
+			if elementPropertyType == "StructProperty" {
+				return readStructArrayProperty(r, arrayLength)
+			}
+
+			result := ArrayProperty{
+				ElementType: elementPropertyType,
+				Count:       arrayLength,
+				Items:       make([]interface{}, arrayLength),
+			}
+			for i := 0; i < int(arrayLength); i++ {
+				elementValue, err := readProperty(r, elementPropertyType, varSize, true)
+				if err != nil {
+					return nil, err
+				}
+				result.Items[i] = elementValue
+			}
+
+			return result, nil
+		}
+	case "StructProperty":
+		{
+			propertyTypeIndex, err := readInt[int16](r)
+			if err != nil {
+				return nil, err
+			}
+			propertyType := names[propertyTypeIndex]
+			// 17 bytes, not sure what they are
+			_, err = r.Seek(17, io.SeekCurrent)
+			if err != nil {
+				return nil, err
+			}
+
+			if propertyType == "PersistenceBlob" {
+				// read all the data
+				// create new reader just for persistence blob
+				// pass new reader to readPersistenceBlob
+				persistenceBytes := make([]byte, varSize)
+				_, err := r.Read(persistenceBytes)
+				if err != nil {
+					return nil, err
+				}
+
+				persistenceReader := bytes.NewReader(persistenceBytes)
+
+				return readPersistenceBlob(persistenceReader, varSize)
+			}
+			if propertyType == "SoftClassPath" {
+				return readStrProperty(r, true)
+			}
+
+			fmt.Println("StructProperty", propertyType, varSize)
+			return StructProperty{}, nil
+		}
+	case "ObjectProperty":
+		{
+			return readObjectProperty(r, raw)
+		}
+	case "ByteProperty":
+		{
+			return readByteProperty(r)
+		}
+	default:
+		{
+			fmt.Println("unknown varType", varType)
+			varData := make([]byte, varSize)
+
+			err := binary.Read(r, binary.LittleEndian, &varData)
+			if err != nil {
+				return nil, err
+			}
+
+			return varData, nil
+		}
+	}
+}
+
+func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32) (map[string]interface{}, error) {
+	variables := map[string]interface{}{}
+
+	for {
+		variableNameIndex, err := readInt[int16](r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			} else {
+				return variables, err
+			}
+		}
+		variableName := names[variableNameIndex]
+
+		varTypeIndex, err := readInt[int16](r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			} else {
+				return variables, err
+			}
+		}
+		varType := names[varTypeIndex]
+
+		if variableName == "None" {
+			_, err = r.Seek(4, io.SeekCurrent)
+			if err != nil {
+				return variables, err
+			}
+		} else {
+			varSize, err := readInt[int32](r)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
 				} else {
-					return err
+					return variables, err
 				}
 			}
 
-			// TODO: Add parsing based on varType
+			// unknown data
+			_, err = r.Seek(4, io.SeekCurrent)
+			if err != nil {
+				return variables, err
+			}
 
-			varName := names[stringIndex]
-			variables[varName] = struct {
-				varType string
-				varData interface{}
-			}{varType: varType, varData: varData}
+			varData, err := readProperty(r, varType, varSize, false)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				} else {
+					return variables, err
+				}
+			}
+
+			variables[variableName] = varData
 		}
 
 		currentPos, err := r.Seek(0, io.SeekCurrent)
 		if err != nil {
-			return err
+			return variables, err
 		}
 
-		if currentPos-objectStart >= maxLength {
+		if currentPos-objectStart >= int64(maxLength) {
 			break
 		}
 	}
 
-	fmt.Println(variables)
-
-	return nil
+	return variables, nil
 }
 
-func DeserializeObject(r *bytes.Reader, name string, objectStart int64, objectLength int64) error {
-	if name == "SavedCharacter" {
-		err := readUSavedCharacter(r, objectStart, objectLength)
-		if err != nil {
-			return err
-		}
-	}
-
-	_, err := r.Seek(objectStart+objectLength, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func readBaseObject(r *bytes.Reader) error {
+func readBaseObject(r io.ReadSeeker) error {
 	objectIndexPos, err := readInt[int64](r)
 	if err != nil {
 		return err
@@ -551,7 +804,7 @@ func readBaseObject(r *bytes.Reader) error {
 		if wasLoaded != 0 {
 			objects[i] = object
 		} else {
-			objectName, err := readFName(r, names)
+			objectName, err := readFName(r)
 			if err != nil {
 				return err
 			}
@@ -589,15 +842,52 @@ func readBaseObject(r *bytes.Reader) error {
 				return err
 			}
 
-			// Log information about the object (replace with your own logging function)
 			fmt.Printf("Reading object '%s'\n", object["name"])
 
-			// err = object.Deserialize(r)
-			// if err != nil {
-			// 	return err
-			// }
-			// TODO: Temporary solution for reading objects (code above)
-			err = DeserializeObject(r, object["name"].(string), objectStart, int64(objectLength))
+			if config.DEBUG_SAVE_DECRYPTED {
+				objectBytes := make([]byte, objectLength)
+				_, err = r.Seek(objectStart, io.SeekStart)
+				if err != nil {
+					return err
+				}
+				_, err = r.Read(objectBytes)
+				if err != nil {
+					return err
+				}
+
+				os.WriteFile("save-objects/"+strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00")+".bin", objectBytes, 0644)
+
+				_, err = r.Seek(objectStart, io.SeekStart)
+				if err != nil {
+					return err
+				}
+			}
+
+			// hack for reading BP header
+			if strings.HasPrefix(object["name"].(string), "BP_") {
+				_, err = r.Seek(4, io.SeekCurrent)
+				if err != nil {
+					return err
+				}
+				dataSize, err := readInt[int32](r)
+				if err != nil {
+					return err
+				}
+				_, err = r.Seek(int64(dataSize+5), io.SeekCurrent)
+				if err != nil {
+					return err
+				}
+			}
+			serializedObject, err := readObject(r, objectStart, objectLength)
+			if err != nil {
+				return err
+			}
+
+			jsonObject, err := json.MarshalIndent(serializedObject, "", "  ")
+			if err != nil {
+				return err
+			}
+			err = os.WriteFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00")+".json", jsonObject, 0644)
 			if err != nil {
 				return err
 			}
@@ -609,7 +899,6 @@ func readBaseObject(r *bytes.Reader) error {
 			}
 
 			if currentPos != objectStart+int64(objectLength) {
-				// Log a warning (replace with your own logging function)
 				fmt.Printf("Warning: Object '%s' didn't read all its data\n", object["name"])
 
 				// Correct the data position
@@ -618,12 +907,6 @@ func readBaseObject(r *bytes.Reader) error {
 					return err
 				}
 			}
-
-			// object["bytes"] = objectBytes
-
-			// if config.DEBUG_SAVE_DECRYPTED {
-			// 	os.WriteFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00")+".bin", objectBytes, 0644)
-			// }
 		} else {
 			_, err = r.Seek(int64(objectLength), io.SeekCurrent)
 			if err != nil {
@@ -652,7 +935,7 @@ func readBaseObject(r *bytes.Reader) error {
 
 const PADDING_SIZE = 0x8
 
-func readProfileFile(r *bytes.Reader) error {
+func readProfileFile(r io.ReadSeeker) error {
 	// skip crc, savedSize, SavegameFileVersion
 	_, err := r.Seek(PADDING_SIZE, io.SeekStart)
 	if err != nil {
@@ -684,7 +967,7 @@ func readProfileFile(r *bytes.Reader) error {
 		return err
 	}
 
-	_, err = r.Seek(int64(stringsTableOffset), io.SeekStart)
+	_, err = r.Seek(stringsTableOffset, io.SeekStart)
 	if err != nil {
 		return err
 	}
@@ -716,24 +999,11 @@ func readProfileFile(r *bytes.Reader) error {
 		return err
 	}
 
-	// here comes get classes to load (in PreloadSave)
-	// we ignore it, since it is not needed for our purposes
-
-	// instead, we do:
-	// USaveGame* SaveGame = NewObject<USaveGame>(GetTransientPackage(), SaveGameClass)
-	// FSaveGameArchive Ar(MemoryReader);
-	// Ar.ReadBaseObject(SaveGame); <-- this part
-
 	return readBaseObject(r)
 }
 
 // TODO:
-// 1. Create struct for each type
-// 2. Create ToString method for each struct
-// 3. Read into struct
-// 4. Fix array, map and struct properties reading
-// 5. Read BP_RemnantSaveGameProfile_C ?
-// 6. Read save file
+// 1. Read PersistenceData.
 func main() {
 	chunks, err := remnant.ReadSaveFile(os.Args[1])
 	if err != nil {
@@ -754,14 +1024,14 @@ func main() {
 		panic(err)
 	}
 
-	if config.DEBUG_SAVE_DECRYPTED {
-		filename := filepath.Base(os.Args[1])
-		extension := filepath.Ext(filename)
-		filenameWithoutExt := filename[0 : len(filename)-len(extension)]
-		os.WriteFile(filenameWithoutExt+"_decrypted.bin", []byte(combined), 0644)
+	// if config.DEBUG_SAVE_DECRYPTED {
+	// 	filename := filepath.Base(os.Args[1])
+	// 	extension := filepath.Ext(filename)
+	// 	filenameWithoutExt := filename[0 : len(filename)-len(extension)]
+	// 	os.WriteFile(filenameWithoutExt+"_decrypted.bin", []byte(combined), 0644)
 
-		for i, chunk := range chunks {
-			os.WriteFile(filenameWithoutExt+"_decrypted_"+strconv.Itoa(i)+".bin", chunk, 0644)
-		}
-	}
+	// 	for i, chunk := range chunks {
+	// 		os.WriteFile(filenameWithoutExt+"_decrypted_"+strconv.Itoa(i)+".bin", chunk, 0644)
+	// 	}
+	// }
 }
