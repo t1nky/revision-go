@@ -45,7 +45,7 @@ const (
 	LOADING_COMPRESSION_CHUNK_SIZE = 131072
 )
 
-func readData(data []byte) ([]byte, error) {
+func decompressData(data []byte) ([]byte, error) {
 	const maxCompressedSize = 10 * 1024 * 1024   // 10 MB
 	const maxDecompressedSize = 20 * 1024 * 1024 // 20 MB
 
@@ -70,7 +70,7 @@ func readData(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func ReadSaveFile(filePath string) ([][]byte, error) {
+func Decompress(filePath string) ([][]byte, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		panic(err)
@@ -101,7 +101,7 @@ func ReadSaveFile(filePath string) ([][]byte, error) {
 			return nil, err
 		}
 
-		buf, err := readData(data)
+		buf, err := decompressData(data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read header: %w", err)
 		}
