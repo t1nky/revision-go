@@ -3,11 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"remnant-save-edit/config"
 	"remnant-save-edit/remnant"
 	"strconv"
@@ -70,6 +70,35 @@ type MapProperty struct {
 }
 
 type ObjectProperty UObject
+
+type PersistenceInfo struct {
+	// struct FInfo
+	// {
+	// 	uint64 UniqueID = 0;
+	// 	uint32 Offset = 0;
+	// 	uint32 Length = 0;
+	// };
+	UniqueID uint64
+	Offset   uint32
+	Length   uint32
+}
+
+type PersistenceContainerHeader struct {
+	// struct FHeader
+	// {
+	// 	uint32 Version = 0;
+	// 	uint32 IndexOffset = 0;
+	// 	uint32 DynamicOffset = 0;
+	// };
+	Version       uint32
+	IndexOffset   uint32
+	DynamicOffset uint32
+}
+
+type PersistenceContainer struct {
+	Header PersistenceContainerHeader
+	Info   []PersistenceInfo
+}
 
 // -- Globals
 
@@ -506,47 +535,162 @@ func readStructArrayProperty(r io.ReadSeeker, arrayLength int32) (StructArrayPro
 	return result, nil
 }
 
-func readPersistenceBlob(r io.ReadSeeker, varSize int32) (interface{}, error) {
-	_, err := r.Seek(12, io.SeekCurrent)
+func readPersistenceBlob(r io.ReadSeeker) (interface{}, error) {
+	// 0x4 size, 0x4 crc?, 0x4 version?
+	version, err := readInt[uint32](r)
 	if err != nil {
 		return nil, err
 	}
-
-	namesOffset, err := readInt[int32](r)
-	if err != nil {
-		return nil, err
-	}
-
-	currentPos, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = r.Seek(int64(namesOffset+4), io.SeekStart)
-	if err != nil {
-		return nil, err
-	}
-
-	namesCount, err := readInt[int32](r)
-	if err != nil {
-		return nil, err
-	}
-
-	persistenceNames := make([]string, namesCount)
-	for i := 0; i < int(namesCount); i++ {
-		persistenceNames[i], err = readFString(r)
+	if version == 4 {
+		// PersistenceBlob inside PersistenceContainer
+		// struct FHeader
+		// {
+		// 	uint32 Version = 0;
+		// 	uint32 IndexOffset = 0;
+		// 	uint32 DynamicOffset = 0;
+		// };
+		// We've already read version, so skip first 4 bytes and read offsets
+		persistenceContainer := PersistenceContainer{
+			Header: PersistenceContainerHeader{
+				Version: version,
+			},
+			Info: []PersistenceInfo{},
+		}
+		persistenceContainer.Header.IndexOffset, err = readInt[uint32](r)
 		if err != nil {
 			return nil, err
 		}
+		persistenceContainer.Header.DynamicOffset, err = readInt[uint32](r)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = r.Seek(int64(persistenceContainer.Header.IndexOffset), io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+
+		// uint32 NumInfos;
+		// Ar << NumInfos;
+		// Info.SetNumUninitialized(NumInfos);
+
+		// for (FInfo& CurInfo : Info)
+		// {
+		// 	Ar << CurInfo.UniqueID;
+		// 	if (Header.Version < 2)
+		// 	{
+		// 		FName Unused;
+		// 		Ar << Unused;
+		// 	}
+		// 	Ar << CurInfo.Offset;
+		// 	Ar << CurInfo.Length;
+		// }
+
+		// uint32 NumDestroyed;
+		// Ar << NumDestroyed;
+		// Destroyed.SetNumUninitialized(NumDestroyed);
+
+		// for (uint64& DestroyedID : Destroyed)
+		// {
+		// 	Ar << DestroyedID;
+		// 	if (Header.Version < 2)
+		// 	{
+		// 		FName Unused;
+		// 		Ar << Unused;
+		// 	}
+		// }
+
+		numInfos, err := readInt[int32](r)
+		if err != nil {
+			return nil, err
+		}
+
+		persistenceContainer.Info = make([]PersistenceInfo, numInfos)
+
+		for i := 0; i < int(numInfos); i++ {
+			persistenceContainer.Info[i] = PersistenceInfo{}
+			persistenceContainer.Info[i].UniqueID, err = readInt[uint64](r)
+			if err != nil {
+				return nil, err
+			}
+			if version < 2 { // in our case version is 4, so this code is basically unreachable
+				_, err = readFString(r) // or readFName if this wont work
+				if err != nil {
+					return nil, err
+				}
+			}
+			persistenceContainer.Info[i].Offset, err = readInt[uint32](r)
+			if err != nil {
+				return nil, err
+			}
+			persistenceContainer.Info[i].Length, err = readInt[uint32](r)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return persistenceContainer, nil
 	}
 
-	_, err = r.Seek(currentPos, io.SeekStart)
+	// else (for our case this is used in Profile)
+	_, err = r.Seek(4, io.SeekCurrent)
 	if err != nil {
 		return nil, err
 	}
 
-	return fmt.Sprintf("%s with size %d", "PersistenceBlob", varSize), nil
+	// Read strings table
+	stringsTableOffset, err := readInt[int64](r)
+	if err != nil {
+		return nil, err
+	}
+
+	startPos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = r.Seek(stringsTableOffset, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	stringsNum, err := readInt[int32](r)
+	if err != nil {
+		return nil, err
+	}
+
+	names = make([]string, stringsNum)
+
+	for i := 0; i < int(stringsNum); i++ {
+		stringData, err := readFString(r)
+		if err != nil {
+			return nil, err
+		}
+		names[i] = stringData
+	}
+
+	_, err = r.Seek(startPos, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	// skip 4 bytes - unknown, version (GUNFIRE_SAVEGAME_ARCHIVE_VERSION)
+	_, err = r.Seek(4, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+
+	// // base object
+	// err = readBaseObject(r)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// return fmt.Sprintf("%s with size %d", "PersistenceBlob", varSize), nil
+	return "PersistenceBlob", nil
 }
+
+var persistenceCounter = 0
 
 func readProperty(r io.ReadSeeker, varType string, varSize int32, raw bool) (interface{}, error) {
 	switch varType {
@@ -642,18 +786,25 @@ func readProperty(r io.ReadSeeker, varType string, varSize int32, raw bool) (int
 			}
 
 			if propertyType == "PersistenceBlob" {
+				persistenceSize, err := readInt[int32](r)
+				if err != nil {
+					return nil, err
+				}
 				// read all the data
 				// create new reader just for persistence blob
 				// pass new reader to readPersistenceBlob
-				persistenceBytes := make([]byte, varSize)
-				_, err := r.Read(persistenceBytes)
+				persistenceBytes := make([]byte, persistenceSize)
+				_, err = r.Read(persistenceBytes)
 				if err != nil {
 					return nil, err
 				}
 
+				SaveToFile(fmt.Sprintf("%d_persistence", persistenceCounter), "bin", persistenceBytes)
+				persistenceCounter++
+
 				persistenceReader := bytes.NewReader(persistenceBytes)
 
-				return readPersistenceBlob(persistenceReader, varSize)
+				return readPersistenceBlob(persistenceReader)
 			}
 			if propertyType == "SoftClassPath" {
 				return readStrProperty(r, true)
@@ -693,9 +844,8 @@ func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32) (map[strin
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
-			} else {
-				return variables, err
 			}
+			return variables, err
 		}
 		variableName := names[variableNameIndex]
 
@@ -703,14 +853,14 @@ func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32) (map[strin
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
-			} else {
-				return variables, err
 			}
+			return variables, err
+
 		}
 		varType := names[varTypeIndex]
 
 		if variableName == "None" {
-			_, err = r.Seek(4, io.SeekCurrent)
+			_, err = r.Seek(2, io.SeekCurrent) // IT WAS 4 BEFORE PARSING PERSISTENCE BLOB
 			if err != nil {
 				return variables, err
 			}
@@ -719,9 +869,8 @@ func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32) (map[strin
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
-				} else {
-					return variables, err
 				}
+				return variables, err
 			}
 
 			// unknown data
@@ -734,9 +883,8 @@ func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32) (map[strin
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
-				} else {
-					return variables, err
 				}
+				return variables, err
 			}
 
 			variables[variableName] = varData
@@ -781,7 +929,7 @@ func readBaseObject(r io.ReadSeeker) error {
 
 	objects = make([]UObject, numUniqueObjects)
 
-	// Read all objects
+	// Read all objects/classes
 	for i := 0; i < int(numUniqueObjects); i++ {
 		wasLoaded, err := readInt[uint8](r)
 		if err != nil {
@@ -855,8 +1003,7 @@ func readBaseObject(r io.ReadSeeker) error {
 					return err
 				}
 
-				os.WriteFile("save-objects/"+strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00")+".bin", objectBytes, 0644)
-
+				SaveToFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00"), "bin", objectBytes)
 				_, err = r.Seek(objectStart, io.SeekStart)
 				if err != nil {
 					return err
@@ -882,15 +1029,7 @@ func readBaseObject(r io.ReadSeeker) error {
 			if err != nil {
 				return err
 			}
-
-			jsonObject, err := json.MarshalIndent(serializedObject, "", "  ")
-			if err != nil {
-				return err
-			}
-			err = os.WriteFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00")+".json", jsonObject, 0644)
-			if err != nil {
-				return err
-			}
+			SaveToFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00"), "json", serializedObject)
 
 			// Check if we've read all the data
 			currentPos, err := r.Seek(0, io.SeekCurrent)
@@ -899,7 +1038,7 @@ func readBaseObject(r io.ReadSeeker) error {
 			}
 
 			if currentPos != objectStart+int64(objectLength) {
-				fmt.Printf("Warning: Object '%s' didn't read all its data\n", object["name"])
+				fmt.Printf("Warning: Object '%s' didn't read all its data (%d /%d; length: %d)\n", object["name"], currentPos, objectStart+int64(objectLength), objectLength)
 
 				// Correct the data position
 				_, err = r.Seek(objectStart+int64(objectLength), io.SeekStart)
@@ -920,13 +1059,23 @@ func readBaseObject(r io.ReadSeeker) error {
 		}
 
 		if isActor != 0 {
-			fmt.Println("Actor")
-			return errors.New("Actor, not implemented yet")
-			// actor := object.ToActor() // You'll have to define how this conversion works
-			// err = readComponents(r, actor)
+			// Not sure about it
+			// componentNameIndex, err := readInt[int32](r)
 			// if err != nil {
 			// 	return err
 			// }
+			// componentName := names[componentNameIndex]
+			_, err = r.Seek(4, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+
+			componentName, err := readFString(r)
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Actor", componentName)
 		}
 	}
 
@@ -1002,8 +1151,6 @@ func readProfileFile(r io.ReadSeeker) error {
 	return readBaseObject(r)
 }
 
-// TODO:
-// 1. Read PersistenceData.
 func main() {
 	chunks, err := remnant.ReadSaveFile(os.Args[1])
 	if err != nil {
@@ -1024,14 +1171,14 @@ func main() {
 		panic(err)
 	}
 
-	// if config.DEBUG_SAVE_DECRYPTED {
-	// 	filename := filepath.Base(os.Args[1])
-	// 	extension := filepath.Ext(filename)
-	// 	filenameWithoutExt := filename[0 : len(filename)-len(extension)]
-	// 	os.WriteFile(filenameWithoutExt+"_decrypted.bin", []byte(combined), 0644)
+	if config.DEBUG_SAVE_DECRYPTED {
+		filename := filepath.Base(os.Args[1])
+		extension := filepath.Ext(filename)
+		filenameWithoutExt := filename[0 : len(filename)-len(extension)]
+		os.WriteFile(filenameWithoutExt+"_decrypted.bin", []byte(combined), 0644)
 
-	// 	for i, chunk := range chunks {
-	// 		os.WriteFile(filenameWithoutExt+"_decrypted_"+strconv.Itoa(i)+".bin", chunk, 0644)
-	// 	}
-	// }
+		for i, chunk := range chunks {
+			os.WriteFile(filenameWithoutExt+"_decrypted_"+strconv.Itoa(i)+".bin", chunk, 0644)
+		}
+	}
 }
