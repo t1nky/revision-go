@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"remnant-save-edit/config"
 	"remnant-save-edit/remnant"
 	"strconv"
@@ -992,7 +991,7 @@ func readBaseObject(r io.ReadSeeker) error {
 
 			fmt.Printf("Reading object '%s'\n", object["name"])
 
-			if config.DEBUG_SAVE_DECRYPTED {
+			if config.DEBUG_SAVE_BINARY {
 				objectBytes := make([]byte, objectLength)
 				_, err = r.Seek(objectStart, io.SeekStart)
 				if err != nil {
@@ -1003,7 +1002,7 @@ func readBaseObject(r io.ReadSeeker) error {
 					return err
 				}
 
-				SaveToFile(strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00"), "bin", objectBytes)
+				SaveToFile(strconv.Itoa(i)+"_object_"+strings.Trim(object["name"].(string), "\x00"), "bin", objectBytes)
 				_, err = r.Seek(objectStart, io.SeekStart)
 				if err != nil {
 					return err
@@ -1171,14 +1170,5 @@ func main() {
 		panic(err)
 	}
 
-	if config.DEBUG_SAVE_DECRYPTED {
-		filename := filepath.Base(os.Args[1])
-		extension := filepath.Ext(filename)
-		filenameWithoutExt := filename[0 : len(filename)-len(extension)]
-		os.WriteFile(filenameWithoutExt+"_decrypted.bin", []byte(combined), 0644)
-
-		for i, chunk := range chunks {
-			os.WriteFile(filenameWithoutExt+"_decrypted_"+strconv.Itoa(i)+".bin", chunk, 0644)
-		}
-	}
+	SaveToFile(config.INPUT_FILE_NAME_WITHOUT_EXTENSION+"_decrypted", "bin", combined)
 }
