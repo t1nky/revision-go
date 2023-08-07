@@ -105,7 +105,7 @@ func readEnumProperty(r io.ReadSeeker, names []string) (EnumProperty, error) {
 		return EnumProperty{}, err
 	}
 
-	// is it always 2 bytes
+	// is it always 2 bytes?
 	enumValueIndex, err := memory.ReadInt[int16](r)
 	if err != nil {
 		return EnumProperty{}, err
@@ -145,7 +145,9 @@ func readMapProperty(r io.ReadSeeker, names []string, objects []ue.UObject) (Map
 
 	values := make([]MapPropertyValue, mapLength)
 	for i := 0; i < int(mapLength); i++ {
-		// -- something is off here, because map does not contain variable size, it is key:value pairs one after another
+		// map does not contain variable size, it is key:value pairs one after another
+		// we might do something else rather than ReadProperty
+		// maybe something like FromBytes
 		key, err := ReadProperty(r, result.KeyType, 0, names, objects, true)
 		if err != nil {
 			return result, err
@@ -413,13 +415,6 @@ func readPersistenceBlob(r io.ReadSeeker) (interface{}, error) {
 		return nil, err
 	}
 	if version == 4 {
-		// PersistenceBlob inside PersistenceContainer
-		// struct FHeader
-		// {
-		// 	uint32 Version = 0;
-		// 	uint32 IndexOffset = 0;
-		// 	uint32 DynamicOffset = 0;
-		// };
 		// We've already read version, so skip first 4 bytes and read offsets
 		persistenceContainer := PersistenceContainer{
 			Header: PersistenceContainerHeader{
@@ -440,36 +435,6 @@ func readPersistenceBlob(r io.ReadSeeker) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		// uint32 NumInfos;
-		// Ar << NumInfos;
-		// Info.SetNumUninitialized(NumInfos);
-
-		// for (FInfo& CurInfo : Info)
-		// {
-		// 	Ar << CurInfo.UniqueID;
-		// 	if (Header.Version < 2)
-		// 	{
-		// 		FName Unused;
-		// 		Ar << Unused;
-		// 	}
-		// 	Ar << CurInfo.Offset;
-		// 	Ar << CurInfo.Length;
-		// }
-
-		// uint32 NumDestroyed;
-		// Ar << NumDestroyed;
-		// Destroyed.SetNumUninitialized(NumDestroyed);
-
-		// for (uint64& DestroyedID : Destroyed)
-		// {
-		// 	Ar << DestroyedID;
-		// 	if (Header.Version < 2)
-		// 	{
-		// 		FName Unused;
-		// 		Ar << Unused;
-		// 	}
-		// }
 
 		numInfos, err := memory.ReadInt[int32](r)
 		if err != nil {
