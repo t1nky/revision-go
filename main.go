@@ -3,9 +3,9 @@ package main
 import (
 	"log"
 	"os"
-	"remnant-save-edit/config"
-	"remnant-save-edit/remnant"
-	"remnant-save-edit/utils"
+	"revision-go/config"
+	"revision-go/remnant"
+	"revision-go/utils"
 )
 
 func main() {

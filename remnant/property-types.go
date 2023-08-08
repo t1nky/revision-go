@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"remnant-save-edit/memory"
-	"remnant-save-edit/ue"
+	"revision-go/memory"
+	"revision-go/ue"
 )
 
 type Property struct {

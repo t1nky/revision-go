@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"remnant-save-edit/memory"
-	"remnant-save-edit/ue"
+	"revision-go/memory"
+	"revision-go/ue"
 )
 
 type OffsetInfo struct {

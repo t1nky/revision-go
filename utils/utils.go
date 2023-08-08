@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"remnant-save-edit/config"
+	"revision-go/config"
 )
 
 func createIfNotExist(name string) error {

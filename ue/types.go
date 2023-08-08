@@ -3,7 +3,7 @@ package ue
 import (
 	"encoding/binary"
 	"io"
-	"remnant-save-edit/memory"
+	"revision-go/memory"
 )
 
 type FTopLevelAssetPath struct {
