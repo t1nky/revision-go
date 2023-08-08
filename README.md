@@ -36,11 +36,14 @@ Then build the project:
 go build
 ```
 
-Usage
+### Usage
+
 TODO: Instructions on how to use the application.
 
-Contributing
+### Contributing
+
 We appreciate all contributions. If you're interested in contributing, please see our CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
 
-License
+### License
+
 This project is licensed under the MIT License. See LICENSE.md for more details.
