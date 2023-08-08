@@ -18,12 +18,13 @@ type OffsetInfo struct {
 }
 
 type ClassData struct {
-	ID int16
-	// Name ue.FName
+	ID         int32
+	FName      ue.FName
+	FNameValue string
 }
 
 type ClassEntry struct {
-	Name           string
+	PathName       string
 	Data           ClassData
 	AdditionalData []Property
 }
@@ -83,37 +84,7 @@ type StructReference struct {
 	GUID GuidData
 }
 
-func readPersistenceBlobObject(r io.ReadSeeker, tables *Tables) (PersistenceBlobObject, error) {
-	name, err := ue.ReadFString(r)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-	size, err := memory.ReadInt[uint32](r)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	start, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	properties, err := readProperties(r, tables)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	_, err = r.Seek(start+int64(size), io.SeekStart)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	return PersistenceBlobObject{
-		Name:       name,
-		Size:       size,
-		Properties: properties,
-	}, nil
-}
+const SKIP_CLASS_ID int32 = -0xFF
 
 func readObject(r io.ReadSeeker, tables *Tables) (UObject, error) {
 	_, err := r.Seek(9, io.SeekCurrent)
@@ -198,83 +169,51 @@ func readNamesTable(r io.ReadSeeker, namesTableOffset uint32) ([]string, error) 
 	return names, nil
 }
 
-func readClassesTable(r io.ReadSeeker, objectsTableOffset uint32) ([]ClassEntry, error) {
+func readClassesTable(r io.ReadSeeker, objectsTableOffset uint32, namesTable []string) ([]ClassEntry, error) {
 	_, err := r.Seek(int64(objectsTableOffset), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
 
-	numUniqueClasses, err := memory.ReadInt[int32](r)
+	numUniqueObjects, err := memory.ReadInt[int32](r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read numUniqueClasses: %w", err)
 	}
 
-	// Assuming baseObject is an empty object.
-	// baseObject := ue.UObject{"name": "BaseObject[SaveGame]"}
-
-	classes := make([]ClassEntry, numUniqueClasses)
+	objects := make([]ClassEntry, numUniqueObjects)
 
 	// Read all objects/classes
-	for i := 0; i < int(numUniqueClasses); i++ {
+	for i := 0; i < int(numUniqueObjects); i++ {
 		wasLoadedByte, err := memory.ReadInt[uint8](r)
 		if err != nil {
-			return classes, fmt.Errorf("failed to read wasLoaded for object %d: %w", i, err)
+			return objects, fmt.Errorf("failed to read wasLoaded for object %d: %w", i, err)
 		}
 		wasLoaded := wasLoadedByte != 0
 
-		className, err := ue.ReadFString(r)
+		classPathName, err := ue.ReadFString(r)
 		if err != nil {
-			return classes, fmt.Errorf("failed to read objectName for object %d: %w", i, err)
+			return objects, fmt.Errorf("failed to read objectName for object %d: %w", i, err)
 		}
 
-		classData := ClassData{ID: -1}
-		// if wasLoaded && i == 0 {
-		// 	object = baseObject
-		// } else {
-		// 	// FindObject and LoadObject logic is replaced with loading from a predefined map or creating a new empty object
-		// 	object = ue.UObject{"name": objectName, "index": i}
-		// }
-
-		// if wasLoaded {
-		// 	objects[i] = object
-		// } else {
-		// 	loadedObjectName, err := ue.ReadFName(r)
-		// 	if err != nil {
-		// 		return objects, fmt.Errorf("failed to read loaded objectName for object %d (%s): %w", i, objectName, err)
-		// 	}
-		// 	outerID, err := memory.ReadInt[int32](r)
-		// 	if err != nil {
-		// 		return objects, fmt.Errorf("failed to read loaded outerID for object %d (%s): %w", i, objectName, err)
-		// 	}
-		// 	object = ue.UObject{"name": names[loadedObjectName.Index], "index": loadedObjectName.Index, "outerId": outerID}
-		// 	objects[i] = object
-		// }
+		classData := ClassData{ID: SKIP_CLASS_ID}
 
 		if !wasLoaded {
-			id, err := memory.ReadInt[int16](r)
+			objectFName, err := ue.ReadFName(r)
 			if err != nil {
-				return classes, fmt.Errorf("failed to read id for object %d (%s): %w", i, className, err)
+				return objects, fmt.Errorf("failed to read objectName for object %d (%s): %w", i, classPathName, err)
 			}
-			_, err = r.Seek(8, io.SeekCurrent)
+			outerID2, err := memory.ReadInt[int32](r)
 			if err != nil {
-				return classes, fmt.Errorf("failed to read id for object %d (%s): %w", i, className, err)
+				return objects, fmt.Errorf("failed to read id for object %d (%s): %w", i, classPathName, err)
 			}
-			// loadedObjectName, err := ue.ReadFName(r)
-			// if err != nil {
-			// 	return classes, fmt.Errorf("failed to read loaded objectName for object %d (%s): %w", i, className, err)
-			// }
-			// outerID, err := memory.ReadInt[int32](r)
-			// if err != nil {
-			// 	return classes, fmt.Errorf("failed to read loaded outerID for object %d (%s): %w", i, className, err)
-			// }
-			// classData.Name = loadedObjectName
-			// classData.ID = outerID
-			classData.ID = id
+			classData.ID = outerID2
+			classData.FName = objectFName
+			classData.FNameValue = namesTable[objectFName.Index]
 		}
 
-		classes[i] = ClassEntry{
-			Name: className,
-			Data: classData,
+		objects[i] = ClassEntry{
+			PathName: classPathName,
+			Data:     classData,
 		}
 	}
 
@@ -457,7 +396,7 @@ func readClassesTable(r io.ReadSeeker, objectsTableOffset uint32) ([]ClassEntry,
 	// 	}
 	// }
 
-	return classes, nil
+	return objects, nil
 }
 
 func readTables(r io.ReadSeeker, offsets OffsetInfo) (Tables, error) {
@@ -470,7 +409,7 @@ func readTables(r io.ReadSeeker, offsets OffsetInfo) (Tables, error) {
 	if err != nil {
 		return Tables{}, fmt.Errorf("failed to read names table: %w", err)
 	}
-	classesTable, err := readClassesTable(r, offsets.Classes)
+	classesTable, err := readClassesTable(r, offsets.Classes, namesTable)
 	if err != nil {
 		return Tables{}, fmt.Errorf("failed to read classes table: %w", err)
 	}
@@ -537,7 +476,35 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, tables *T
 	switch varType {
 	case "IntProperty":
 		{
-			return readIntProperty(r, raw)
+			return readNumProperty[int32](r, raw)
+		}
+	case "Int16Property":
+		{
+			return readNumProperty[int16](r, raw)
+		}
+	case "Int64Property":
+		{
+			return readNumProperty[int64](r, raw)
+		}
+	case "UInt64Property":
+		{
+			return readNumProperty[uint64](r, raw)
+		}
+	case "FloatProperty":
+		{
+			return readNumProperty[float32](r, raw)
+		}
+	case "DoubleProperty":
+		{
+			return readNumProperty[float64](r, raw)
+		}
+	case "UInt16Property":
+		{
+			return readNumProperty[uint16](r, raw)
+		}
+	case "UInt32Property":
+		{
+			return readNumProperty[uint32](r, raw)
 		}
 	case "SoftClassPath":
 		{
@@ -566,26 +533,6 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, tables *T
 	case "MapProperty":
 		{
 			if raw {
-				// struct MapStructPropertyParser;
-
-				// impl PropertyReader for MapStructPropertyParser {
-				// 	fn read(&mut self, _reader: &mut Reader, _name_table: &SavNameTable, _size: u32) -> anyhow::Result<PropertyData> {
-				// 		panic!("Unsupported operation");
-				// 	}
-
-				// 	fn read_head(&mut self, _reader: &mut Reader, _name_table: &SavNameTable) -> anyhow::Result<()> {
-				// 		Ok(())
-				// 	}
-
-				// 	fn read_raw(&mut self, reader: &mut Reader, _name_table: &SavNameTable) -> anyhow::Result<PropertyData> {
-				// 		let value = FGuid::read(reader)?;
-
-				// 		Ok(PropertyData::StructReference{
-				// 			guid: value,
-				// 		})
-				// 	}
-				// }
-
 				log.Fatal("Raw map property is not supported yet")
 			}
 			return readMapProperty(r, tables)
@@ -602,19 +549,10 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, tables *T
 		{
 			return readTextProperty(r, raw)
 		}
-	case "UInt64Property":
-		{
-			return readUInt64Property(r, raw)
-		}
-	case "FloatProperty":
-		{
-			return readFloatProperty(r, raw)
-		}
 	case "NameProperty":
 		{
 			return readNameProperty(r, tables, raw)
 		}
-
 	case "ArrayProperty":
 		{
 			elementsType, err := readName(r, tables)
@@ -722,17 +660,11 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, tables *T
 		}
 	default:
 		{
-			fmt.Println("unknown varType", varType)
-			varData := make([]byte, varSize)
-
-			err := binary.Read(r, binary.LittleEndian, &varData)
-			if err != nil {
-				return nil, err
-			}
-
-			return varData, nil
+			log.Fatal("Raw map property is not supported yet")
 		}
 	}
+
+	return nil, nil
 }
 
 func readProperty(r io.ReadSeeker, tables *Tables) (*Property, error) {
@@ -765,15 +697,6 @@ func readProperty(r io.ReadSeeker, tables *Tables) (*Property, error) {
 		return nil, fmt.Errorf("failed to read variable data (%s %s %d): %w", variableName, varType, varSize, err)
 	}
 
-	// currentPos, err := r.Seek(0, io.SeekCurrent)
-	// if err != nil {
-	// 	return variables, err
-	// }
-
-	// if currentPos-objectStart >= int64(maxLength) {
-	// 	break
-	// }
-
 	return &Property{
 		Name:  variableName,
 		Type:  varType,
@@ -781,11 +704,6 @@ func readProperty(r io.ReadSeeker, tables *Tables) (*Property, error) {
 		Size:  varSize,
 		Value: value,
 	}, nil
-
-	// property, err = ReadProperty(r, varType, varSize, names, objects, false)
-	// if err != nil {
-	// 	return property, fmt.Errorf("failed to read variable data (%s %s %d): %w", variableName, varType, varSize, err)
-	// }
 }
 
 func readProperties(r io.ReadSeeker, tables *Tables) ([]Property, error) {
@@ -807,7 +725,7 @@ func readProperties(r io.ReadSeeker, tables *Tables) ([]Property, error) {
 func readClassAdditionalData(r io.ReadSeeker, tables *Tables) error {
 	trimOffset := 0
 	for i := 0; i < len(tables.Classes); i++ {
-		if tables.Classes[i].Data.ID < 0 {
+		if tables.Classes[i].Data.ID == SKIP_CLASS_ID {
 			break
 		}
 		trimOffset++
@@ -875,10 +793,6 @@ func ProcessData(data *[]byte) ([]UObject, error) {
 	if err != nil {
 		return nil, err
 	}
-	// startPos, err := r.Seek(0, io.SeekCurrent)
-	// if err != nil {
-	// 	return nil, err
-	// }
 
 	baseObjectProperties, err := readProperties(r, &tables)
 	if err != nil {
@@ -887,7 +801,6 @@ func ProcessData(data *[]byte) ([]UObject, error) {
 
 	objects := []UObject{}
 	objects = append(objects, UObject{
-
 		Properties: baseObjectProperties,
 	})
 
