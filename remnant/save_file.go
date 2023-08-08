@@ -8,40 +8,48 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"remnant-save-edit/config"
-	"remnant-save-edit/memory"
 	"remnant-save-edit/ue"
-	"remnant-save-edit/utils"
-	"strconv"
-	"strings"
 )
 
-type CompressedChunkInfo struct {
-	CompressedSize   int64
-	UncompressedSize int64
-}
-
-type ChunkHeader struct {
-	BuildNumber uint32
-	UEVersion   [8]byte // int32 x2
-	_           [4]byte // maybe related to SaveGameClassPath, struct type? F1 03 00 00
+type SaveHeader struct {
+	Crc                 uint32
+	BytesWritten        uint32
+	SaveGameFileVersion int32 // version <= 8 -- uncompressed
 }
 
 type CompressedChunkHeader struct {
 	PackageFileTag              uint64
 	LoadingCompressionChunkSize uint64
 	Compressor                  byte
-	Size                        uint64
+	CompressedSize              uint64
 
 	LoadingCompressionChunkSize2 uint64
 	Size2                        uint64
 	LoadingCompressionChunkSize3 uint64
 }
 
-type SaveHeader struct {
-	Crc                 uint32
-	BytesWritten        uint32
-	SaveGameFileVersion int32 // version <= 8 -- uncompressed
+type CompressedSaveChunk struct {
+	Header CompressedChunkHeader
+	Data   []byte
+}
+
+type DataHeader struct {
+	UncompressedSize uint32
+
+	BuildNumber uint32
+	UE4Version  uint32
+	UE5Version  uint32
+}
+
+type ProcessedData struct {
+	Header            DataHeader
+	SaveGameClassPath ue.FTopLevelAssetPath
+
+	NamesOffset uint32   `json:"-"`
+	NamesTable  []string `json:"-"`
+
+	ObjectsOffset uint32 `json:"-"`
+	Objects       []ClassEntry
 }
 
 const (
@@ -76,7 +84,7 @@ func decompressData(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func Decompress(filePath string) ([][]byte, error) {
+func readSave(filePath string) ([]CompressedSaveChunk, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		panic(err)
@@ -89,11 +97,11 @@ func Decompress(filePath string) ([][]byte, error) {
 		return nil, fmt.Errorf("failed to seek: %w", err)
 	}
 
-	result := [][]byte{}
+	result := []CompressedSaveChunk{}
 
 	for {
-		chunkHeader := CompressedChunkHeader{}
-		err = binary.Read(file, binary.LittleEndian, &chunkHeader)
+		compressedChunkHeader := CompressedChunkHeader{}
+		err = binary.Read(file, binary.LittleEndian, &compressedChunkHeader)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -101,316 +109,45 @@ func Decompress(filePath string) ([][]byte, error) {
 			return nil, err
 		}
 
-		data := make([]byte, chunkHeader.Size)
+		data := make([]byte, compressedChunkHeader.CompressedSize)
 		err = binary.Read(file, binary.LittleEndian, &data)
 		if err != nil {
 			return nil, err
 		}
 
-		buf, err := decompressData(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read header: %w", err)
-		}
-
-		result = append(result, buf)
+		result = append(result, CompressedSaveChunk{
+			Header: compressedChunkHeader,
+			Data:   data,
+		})
 	}
 
 	return result, nil
 }
 
-func readObject(r io.ReadSeeker, objectStart int64, maxLength uint32, names []string, objects []ue.UObject) (map[string]interface{}, error) {
-	variables := map[string]interface{}{}
+func decompressChunks(chunks []CompressedSaveChunk) (*[]byte, error) {
+	var result bytes.Buffer
 
-	for {
-		variableNameIndex, err := memory.ReadInt[int16](r)
+	for _, chunk := range chunks {
+		buf, err := decompressData(chunk.Data)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return variables, err
-		}
-		variableName := names[variableNameIndex]
-
-		varTypeIndex, err := memory.ReadInt[int16](r)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return variables, err
-
-		}
-		varType := names[varTypeIndex]
-
-		if variableName == "None" {
-			_, err = r.Seek(2, io.SeekCurrent) // IT WAS 4 BEFORE PARSING PERSISTENCE BLOB
-			if err != nil {
-				return variables, err
-			}
-		} else {
-			varSize, err := memory.ReadInt[int32](r)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return variables, err
-			}
-
-			// unknown data
-			_, err = r.Seek(4, io.SeekCurrent)
-			if err != nil {
-				return variables, err
-			}
-
-			varData, err := ReadProperty(r, varType, varSize, names, objects, false)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return variables, err
-			}
-
-			variables[variableName] = varData
+			return nil, fmt.Errorf("failed to decompress chunk: %w", err)
 		}
 
-		currentPos, err := r.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return variables, err
-		}
-
-		if currentPos-objectStart >= int64(maxLength) {
-			break
-		}
+		result.Write(buf)
 	}
 
-	return variables, nil
+	resultBytes := result.Bytes()
+
+	// utils.SaveToFile(config.INPUT_FILE_NAME_WITHOUT_EXTENSION, config.INPUT_FILE_NAME_WITHOUT_EXTENSION+"_decompressed", "bin", resultBytes)
+
+	return &resultBytes, nil
 }
 
-func readBaseObject(r io.ReadSeeker, names []string) error {
-	var objects []ue.UObject
-
-	objectIndexPos, err := memory.ReadInt[int64](r)
+func ReadData(filePath string) (*[]byte, error) {
+	chunks, err := readSave(filePath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	startPos, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
-	_, err = r.Seek(objectIndexPos, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	numUniqueObjects, err := memory.ReadInt[int32](r)
-	if err != nil {
-		return err
-	}
-
-	// Assuming baseObject is an empty object.
-	baseObject := ue.UObject{"name": "BaseObject[SaveGame]"}
-
-	objects = make([]ue.UObject, numUniqueObjects)
-
-	// Read all objects/classes
-	for i := 0; i < int(numUniqueObjects); i++ {
-		wasLoaded, err := memory.ReadInt[uint8](r)
-		if err != nil {
-			return err
-		}
-
-		objectName, err := ue.ReadFString(r)
-		if err != nil {
-			return err
-		}
-
-		var object ue.UObject
-		if wasLoaded != 0 && i == 0 {
-			object = baseObject
-		} else {
-			// FindObject and LoadObject logic is replaced with loading from a predefined map or creating a new empty object
-			object = ue.UObject{"name": objectName, "index": i}
-		}
-
-		if wasLoaded != 0 {
-			objects[i] = object
-		} else {
-			objectName, err := ue.ReadFName(r)
-			if err != nil {
-				return err
-			}
-			outerID, err := memory.ReadInt[int32](r)
-			if err != nil {
-				return err
-			}
-			object = ue.UObject{"name": names[objectName.Index], "index": objectName.Index, "outerId": outerID}
-			objects[i] = object
-		}
-	}
-
-	_, err = r.Seek(startPos, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < len(objects); i++ {
-		objectID, err := memory.ReadInt[int32](r)
-		if err != nil {
-			return err
-		}
-
-		objectLength, err := memory.ReadInt[uint32](r)
-		if err != nil {
-			return err
-		}
-
-		var object ue.UObject
-		if objectID >= 0 && objectID < int32(len(objects)) && objectLength > 0 {
-			object = objects[objectID]
-
-			objectStart, err := r.Seek(0, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-
-			fmt.Printf("Reading object '%s'\n", object["name"])
-
-			if config.DEBUG_SAVE_BINARY {
-				objectBytes := make([]byte, objectLength)
-				_, err = r.Seek(objectStart, io.SeekStart)
-				if err != nil {
-					return err
-				}
-				_, err = r.Read(objectBytes)
-				if err != nil {
-					return err
-				}
-
-				utils.SaveToFile(config.INPUT_FILE_NAME_WITHOUT_EXTENSION, strconv.Itoa(i)+"_object_"+strings.Trim(object["name"].(string), "\x00"), "bin", objectBytes)
-				_, err = r.Seek(objectStart, io.SeekStart)
-				if err != nil {
-					return err
-				}
-			}
-
-			// hack for reading BP header
-			if strings.HasPrefix(object["name"].(string), "BP_") {
-				_, err = r.Seek(4, io.SeekCurrent)
-				if err != nil {
-					return err
-				}
-				dataSize, err := memory.ReadInt[int32](r)
-				if err != nil {
-					return err
-				}
-				_, err = r.Seek(int64(dataSize+5), io.SeekCurrent)
-				if err != nil {
-					return err
-				}
-			}
-			serializedObject, err := readObject(r, objectStart, objectLength, names, objects)
-			if err != nil {
-				return err
-			}
-			utils.SaveToFile(config.INPUT_FILE_NAME_WITHOUT_EXTENSION, strconv.Itoa(i)+"_"+strings.Trim(object["name"].(string), "\x00"), "json", serializedObject)
-
-			// Check if we've read all the data
-			currentPos, err := r.Seek(0, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-
-			if currentPos != objectStart+int64(objectLength) {
-				fmt.Printf("Warning: Object '%s' didn't read all its data (%d /%d; length: %d)\n", object["name"], currentPos, objectStart+int64(objectLength), objectLength)
-
-				// Correct the data position
-				_, err = r.Seek(objectStart+int64(objectLength), io.SeekStart)
-				if err != nil {
-					return err
-				}
-			}
-		} else {
-			_, err = r.Seek(int64(objectLength), io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-		}
-
-		isActor, err := memory.ReadInt[uint8](r)
-		if err != nil {
-			return err
-		}
-
-		if isActor != 0 {
-			// Not sure about it
-			// componentNameIndex, err := memory.ReadInt[int32](r)
-			// if err != nil {
-			// 	return err
-			// }
-			// componentName := names[componentNameIndex]
-			_, err = r.Seek(4, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-
-			componentName, err := ue.ReadFString(r)
-			if err != nil {
-				return err
-			}
-
-			fmt.Println("Actor", componentName)
-		}
-	}
-
-	return nil
-}
-
-func ProcessData(r io.ReadSeeker) error {
-	var names []string
-
-	// Read strings table
-	stringsTableOffset, err := memory.ReadInt[int64](r)
-	if err != nil {
-		return err
-	}
-
-	startPos, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
-	_, err = r.Seek(stringsTableOffset, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	stringsNum, err := memory.ReadInt[int32](r)
-	if err != nil {
-		return err
-	}
-
-	names = make([]string, stringsNum)
-
-	for i := 0; i < int(stringsNum); i++ {
-		stringData, err := ue.ReadFString(r)
-		if err != nil {
-			return err
-		}
-		names[i] = stringData
-	}
-
-	_, err = r.Seek(startPos, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	// read version
-	// version, err = memory.ReadInt[int32](r) // version
-	_, err = r.Seek(4, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
-	return readBaseObject(r, names)
+	return decompressChunks(chunks)
 }

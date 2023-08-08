@@ -6,8 +6,6 @@ import (
 	"remnant-save-edit/memory"
 )
 
-type UObject map[string]interface{}
-
 type FTopLevelAssetPath struct {
 	PackageName string
 	AssetName   string
@@ -22,6 +20,9 @@ func ReadFString(r io.Reader) (string, error) {
 	stringSize, err := memory.ReadInt[int32](r)
 	if err != nil {
 		return "", err
+	}
+	if stringSize <= 0 {
+		return "", nil
 	}
 	stringData := make([]byte, stringSize)
 	err = binary.Read(r, binary.LittleEndian, &stringData)
