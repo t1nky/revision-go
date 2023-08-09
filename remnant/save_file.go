@@ -8,14 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"revision-go/ue"
 )
-
-type SaveHeader struct {
-	Crc                 uint32
-	BytesWritten        uint32
-	SaveGameFileVersion int32 // version <= 8 -- uncompressed
-}
 
 type CompressedChunkHeader struct {
 	PackageFileTag              uint64
@@ -33,23 +26,11 @@ type CompressedSaveChunk struct {
 	Data   []byte
 }
 
-type DataHeader struct {
-	UncompressedSize uint32
-
-	BuildNumber uint32
-	UE4Version  uint32
-	UE5Version  uint32
-}
-
-type ProcessedData struct {
-	Header            DataHeader
-	SaveGameClassPath ue.FTopLevelAssetPath
-
-	NamesOffset uint32   `json:"-"`
-	NamesTable  []string `json:"-"`
-
-	ObjectsOffset uint32 `json:"-"`
-	Objects       []ClassEntry
+type SaveFile struct {
+	Crc32       uint32
+	ContentSize uint32
+	Version     uint32
+	Chunks      []CompressedSaveChunk
 }
 
 const (
@@ -60,8 +41,8 @@ const (
 )
 
 func decompressData(data []byte) ([]byte, error) {
-	const maxCompressedSize = 10 * 1024 * 1024   // 10 MB
-	const maxDecompressedSize = 20 * 1024 * 1024 // 20 MB
+	const maxCompressedSize = 20 * 1024 * 1024   // 20 MB
+	const maxDecompressedSize = 40 * 1024 * 1024 // 40 MB
 
 	if len(data) > maxCompressedSize {
 		return nil, fmt.Errorf("compressed data is too large")
@@ -84,20 +65,32 @@ func decompressData(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func readSave(filePath string) ([]CompressedSaveChunk, error) {
+func readSave(filePath string) (*SaveFile, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
 
-	saveHeader := SaveHeader{}
-	err = binary.Read(file, binary.LittleEndian, &saveHeader)
+	var crc32 uint32
+	err = binary.Read(file, binary.LittleEndian, &crc32)
 	if err != nil {
-		return nil, fmt.Errorf("failed to seek: %w", err)
+		return nil, err
 	}
 
-	result := []CompressedSaveChunk{}
+	var contentSize uint32
+	err = binary.Read(file, binary.LittleEndian, &contentSize)
+	if err != nil {
+		return nil, err
+	}
+
+	var version uint32
+	err = binary.Read(file, binary.LittleEndian, &version)
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := []CompressedSaveChunk{}
 
 	for {
 		compressedChunkHeader := CompressedChunkHeader{}
@@ -115,19 +108,34 @@ func readSave(filePath string) ([]CompressedSaveChunk, error) {
 			return nil, err
 		}
 
-		result = append(result, CompressedSaveChunk{
+		chunks = append(chunks, CompressedSaveChunk{
 			Header: compressedChunkHeader,
 			Data:   data,
 		})
 	}
 
-	return result, nil
+	return &SaveFile{
+		Crc32:       crc32,
+		ContentSize: contentSize,
+		Version:     version,
+		Chunks:      chunks,
+	}, nil
 }
 
-func decompressChunks(chunks []CompressedSaveChunk) (*[]byte, error) {
+func decompressChunks(saveFile *SaveFile) ([]byte, error) {
 	var result bytes.Buffer
 
-	for _, chunk := range chunks {
+	err := binary.Write(&result, binary.LittleEndian, saveFile.Crc32)
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Write(&result, binary.LittleEndian, saveFile.ContentSize)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, chunk := range saveFile.Chunks {
 		buf, err := decompressData(chunk.Data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress chunk: %w", err)
@@ -136,18 +144,17 @@ func decompressChunks(chunks []CompressedSaveChunk) (*[]byte, error) {
 		result.Write(buf)
 	}
 
-	resultBytes := result.Bytes()
+	data := result.Bytes()
+	binary.LittleEndian.PutUint32(data[8:], uint32(saveFile.Version))
 
-	// utils.SaveToFile(config.INPUT_FILE_NAME_WITHOUT_EXTENSION, config.INPUT_FILE_NAME_WITHOUT_EXTENSION+"_decompressed", "bin", resultBytes)
-
-	return &resultBytes, nil
+	return data, nil
 }
 
-func ReadData(filePath string) (*[]byte, error) {
-	chunks, err := readSave(filePath)
+func ReadData(filePath string) ([]byte, error) {
+	saveFile, err := readSave(filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	return decompressChunks(chunks)
+	return decompressChunks(saveFile)
 }

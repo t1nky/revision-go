@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"log"
 	"os"
 	"revision-go/config"
@@ -14,7 +15,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	result, err := remnant.ProcessData(fileData)
+	result, err := remnant.ReadSaveArchive(bytes.NewReader(fileData))
 	if err != nil {
 		log.Fatal(err)
 	}

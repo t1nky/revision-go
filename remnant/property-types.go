@@ -5,8 +5,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"revision-go/memory"
 	"revision-go/ue"
+)
+
+const (
+	REMNANT_SAVE_GAME_PROFILE = "/Game/_Core/Blueprints/Base/BP_RemnantSaveGameProfile"
+	REMNANT_SAVE_GAME         = "/Game/_Core/Blueprints/Base/BP_RemnantSaveGame"
 )
 
 type Property struct {
@@ -29,8 +35,9 @@ type ArrayProperty struct {
 
 type StructProperty struct {
 	Name  string
-	GUID  GuidData
+	GUID  ue.FGuid
 	Value interface{}
+	Size  uint32
 }
 
 type EnumProperty struct {
@@ -68,16 +75,74 @@ type ByteProperty interface {
 	byte | string
 }
 
-type PersistenceResult struct {
-	ID       int32
-	UniqueID uint64
-	Data     interface{}
+type PersistenceBlob struct {
+	Archive SaveData
 }
 
-type Vector struct {
-	X float64
-	Y float64
-	Z float64
+type PersistenceContainer struct {
+	Version   uint32
+	Destroyed []uint64
+	Actors    map[uint64]Actor
+}
+
+type Actor struct {
+	Transform   ue.FTransform
+	Archive     SaveData
+	DynamicData DynamicActor
+}
+
+func readActor(r io.ReadSeeker) (Actor, error) {
+	hasTransform, err := memory.ReadInt[uint32](r)
+	if err != nil {
+		return Actor{}, fmt.Errorf("readActor: %w", err)
+	}
+
+	var transform ue.FTransform
+	if hasTransform != 0 {
+		transform, err = ue.ReadFTransform(r)
+		if err != nil {
+			return Actor{}, fmt.Errorf("readActor: %w", err)
+		}
+	}
+
+	archive, err := readSaveData(r, false, false)
+	if err != nil {
+		return Actor{}, fmt.Errorf("readActor: %w", err)
+	}
+
+	return Actor{
+		Transform: transform,
+		Archive:   archive,
+	}, nil
+}
+
+type DynamicActor struct {
+	UniqueID  uint64
+	Transform ue.FTransform
+	ClassPath ue.FTopLevelAssetPath
+}
+
+func readDynamicActor(r io.Reader) (DynamicActor, error) {
+	uniqueID, err := memory.ReadInt[uint64](r)
+	if err != nil {
+		return DynamicActor{}, fmt.Errorf("readDynamicActor: %w", err)
+	}
+
+	transform, err := ue.ReadFTransform(r)
+	if err != nil {
+		return DynamicActor{}, fmt.Errorf("readDynamicActor: %w", err)
+	}
+
+	classPath, err := ue.ReadFTopLevelAssetPath(r)
+	if err != nil {
+		return DynamicActor{}, fmt.Errorf("readDynamicActor: %w", err)
+	}
+
+	return DynamicActor{
+		UniqueID:  uniqueID,
+		Transform: transform,
+		ClassPath: classPath,
+	}, nil
 }
 
 type Number interface {
@@ -86,7 +151,6 @@ type Number interface {
 
 func readNumProperty[T Number](r io.ReadSeeker, raw bool) (T, error) {
 	if !raw {
-		// 1 unknown byte?
 		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
 			return 0, fmt.Errorf("readIntProperty: %w", err)
@@ -102,20 +166,22 @@ func readNumProperty[T Number](r io.ReadSeeker, raw bool) (T, error) {
 	return varData, nil
 }
 
-func readBoolProperty(r io.ReadSeeker) (bool, error) {
+func readBoolProperty(r io.ReadSeeker, raw bool) (bool, error) {
 	varData, err := memory.ReadInt[uint8](r)
 	if err != nil {
 		return false, fmt.Errorf("readBoolProperty: %w", err)
 	}
-	_, err = r.Seek(1, io.SeekCurrent)
-	if err != nil {
-		return false, fmt.Errorf("readBoolProperty: %w", err)
+	if !raw {
+		_, err = r.Seek(1, io.SeekCurrent)
+		if err != nil {
+			return false, fmt.Errorf("readBoolProperty: %w", err)
+		}
 	}
 	return varData == 1, nil
 }
 
-func readEnumProperty(r io.ReadSeeker, tables *Tables) (EnumProperty, error) {
-	enumType, err := readName(r, tables)
+func readEnumProperty(r io.ReadSeeker, saveData *SaveData) (EnumProperty, error) {
+	enumType, err := readName(r, saveData)
 	if err != nil {
 		return EnumProperty{}, fmt.Errorf("readEnumProperty: %w", err)
 	}
@@ -125,7 +191,7 @@ func readEnumProperty(r io.ReadSeeker, tables *Tables) (EnumProperty, error) {
 		return EnumProperty{}, fmt.Errorf("readEnumProperty: %w", err)
 	}
 
-	enumValue, err := readName(r, tables)
+	enumValue, err := readName(r, saveData)
 	if err != nil {
 		return EnumProperty{}, fmt.Errorf("readEnumProperty: %w", err)
 	}
@@ -136,17 +202,17 @@ func readEnumProperty(r io.ReadSeeker, tables *Tables) (EnumProperty, error) {
 	}, nil
 }
 
-func readMapProperty(r io.ReadSeeker, tables *Tables) (MapProperty, error) {
+func readMapProperty(r io.ReadSeeker, saveData *SaveData) (MapProperty, error) {
 	result := MapProperty{}
 
 	var err error
 
-	result.KeyType, err = readName(r, tables)
+	result.KeyType, err = readName(r, saveData)
 	if err != nil {
 		return result, fmt.Errorf("readMapProperty: %w", err)
 	}
 
-	result.ValueType, err = readName(r, tables)
+	result.ValueType, err = readName(r, saveData)
 	if err != nil {
 		return result, fmt.Errorf("readMapProperty: %w", err)
 	}
@@ -163,11 +229,11 @@ func readMapProperty(r io.ReadSeeker, tables *Tables) (MapProperty, error) {
 
 	values := make([]MapPropertyValue, mapLength)
 	for i := 0; i < int(mapLength); i++ {
-		key, err := getPropertyValue(r, result.KeyType, 0, tables, true)
+		key, err := getPropertyValue(r, result.KeyType, 0, saveData, true)
 		if err != nil {
 			return result, fmt.Errorf("readMapProperty: %w", err)
 		}
-		value, err := getPropertyValue(r, result.ValueType, 0, tables, true)
+		value, err := getPropertyValue(r, result.ValueType, 0, saveData, true)
 		if err != nil {
 			return result, fmt.Errorf("readMapProperty: %w", err)
 		}
@@ -181,7 +247,6 @@ func readMapProperty(r io.ReadSeeker, tables *Tables) (MapProperty, error) {
 
 func readStrProperty(r io.ReadSeeker, raw bool) (string, error) {
 	if !raw {
-		// unknown 1 byte
 		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
 			return "", fmt.Errorf("readStrProperty: %w", err)
@@ -205,26 +270,19 @@ func readStrProperty(r io.ReadSeeker, raw bool) (string, error) {
 	return string(strData), nil
 }
 
-func readNameProperty(r io.ReadSeeker, tables *Tables, raw bool) (string, error) {
+func readNameProperty(r io.ReadSeeker, saveData *SaveData, raw bool) (string, error) {
 	if !raw {
-		// unknown 1 byte
 		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	name, err := readName(r, tables)
-	if err != nil {
-		return "", err
-	}
-
-	return name, nil
+	return readName(r, saveData)
 }
 
 func readTextProperty(r io.ReadSeeker, raw bool) (TextProperty, error) {
 	if !raw {
-		// unknown 1 byte
 		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
 			return TextProperty{}, err
@@ -294,9 +352,8 @@ func readTextProperty(r io.ReadSeeker, raw bool) (TextProperty, error) {
 	}, nil
 }
 
-func readObjectProperty(r io.ReadSeeker, tables *Tables, raw bool) (ObjectProperty, error) {
+func readObjectProperty(r io.ReadSeeker, saveData *SaveData, raw bool) (ObjectProperty, error) {
 	if !raw {
-		// unknown 1 byte
 		_, err := r.Seek(1, io.SeekCurrent)
 		if err != nil {
 			return ObjectProperty{}, err
@@ -309,31 +366,28 @@ func readObjectProperty(r io.ReadSeeker, tables *Tables, raw bool) (ObjectProper
 	}
 
 	if objectIndex == -1 {
-		// no object
 		return ObjectProperty{}, nil
 	}
 
 	return ObjectProperty{
-		ClassName: tables.Classes[objectIndex].PathName,
+		ClassName: saveData.ObjectIndex[objectIndex].ObjectPath,
 	}, nil
 }
 
-func readName(r io.Reader, tables *Tables) (string, error) {
-	nameIndex, err := memory.ReadInt[uint16](r)
+func readName(r io.Reader, saveData *SaveData) (string, error) {
+	fName, err := ue.ReadFName(r)
 	if err != nil {
 		return "", err
 	}
-	if nameIndex >= uint16(len(tables.Names)) {
-		return "", fmt.Errorf("nameIndex is out of range: %d", nameIndex)
-	}
-	name := tables.Names[nameIndex]
 
-	return name, nil
+	if int(fName.Index) >= len(saveData.NamesTable) {
+		return "", fmt.Errorf("readNameProperty: invalid index %d", fName.Index)
+	}
+
+	return saveData.NamesTable[fName.Index], nil
 }
 
-func readByteProperty(r io.ReadSeeker, tables *Tables, raw bool) (interface{}, error) {
-	// not sure why is it 8 bytes
-
+func readByteProperty(r io.ReadSeeker, saveData *SaveData, raw bool) (interface{}, error) {
 	if raw {
 		value, err := memory.ReadInt[uint8](r)
 		if err != nil {
@@ -342,20 +396,16 @@ func readByteProperty(r io.ReadSeeker, tables *Tables, raw bool) (interface{}, e
 
 		return value, nil
 	}
-	name, err := readName(r, tables)
+	name, err := readName(r, saveData)
+	if err != nil {
+		return 0, err
+	}
+	_, err = r.Seek(1, io.SeekCurrent)
 	if err != nil {
 		return 0, err
 	}
 
 	if name == "None" {
-		// or the other way around?
-		// currently for equipment level it reads 0xA (10)
-		// and following byte is 0
-		_, err = r.Seek(1, io.SeekCurrent)
-		if err != nil {
-			return 0, err
-		}
-
 		byteData, err := memory.ReadInt[uint8](r)
 		if err != nil {
 			return 0, err
@@ -364,51 +414,14 @@ func readByteProperty(r io.ReadSeeker, tables *Tables, raw bool) (interface{}, e
 		return byteData, nil
 	}
 
-	_, err = r.Seek(1, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-
-	enumName, err := readName(r, tables)
+	enumName, err := readName(r, saveData)
 	if err != nil {
 		return 0, err
 	}
 	return enumName, nil
 }
 
-func readPersistenceBlobObject(r io.ReadSeeker, tables *Tables) (PersistenceBlobObject, error) {
-	name, err := ue.ReadFString(r)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-	size, err := memory.ReadInt[uint32](r)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	start, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	properties, err := readProperties(r, tables)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	_, err = r.Seek(start+int64(size), io.SeekStart)
-	if err != nil {
-		return PersistenceBlobObject{}, err
-	}
-
-	return PersistenceBlobObject{
-		Name:       name,
-		Size:       size,
-		Properties: properties,
-	}, nil
-}
-
-func readStructProperty(r io.ReadSeeker, structName string, varSize uint32, tables *Tables) (interface{}, error) {
+func readStructPropertyData(r io.ReadSeeker, structName string, saveData *SaveData) (interface{}, error) {
 	if structName == "SoftClassPath" {
 		return readStrProperty(r, true)
 	}
@@ -419,198 +432,432 @@ func readStructProperty(r io.ReadSeeker, structName string, varSize uint32, tabl
 		return memory.ReadInt[int64](r)
 	}
 	if structName == "PersistenceBlob" {
-		// read all the data
-		// create new reader just for persistence blob
-		// pass new reader to readPersistenceBlob
-		persistenceBytes := make([]byte, varSize)
-		_, err := r.Read(persistenceBytes)
+		persistenceSize, err := memory.ReadInt[uint32](r)
 		if err != nil {
 			return nil, err
 		}
 
-		version := binary.LittleEndian.Uint32(persistenceBytes[4:8])
-
-		if version == 4 {
-			return readPersistenceContainer(persistenceBytes)
+		persistenceBytes := make([]byte, persistenceSize)
+		_, err = r.Read(persistenceBytes)
+		if err != nil {
+			return nil, err
 		}
-
 		persistenceReader := bytes.NewReader(persistenceBytes)
-		var persistenceBlobHeader PersistenceBlobHeader
-		err = binary.Read(persistenceReader, binary.LittleEndian, &persistenceBlobHeader)
-		if err != nil {
-			return nil, err
-		}
 
-		persistenceTables, err := readTables(persistenceReader, OffsetInfo{
-			Names:   persistenceBlobHeader.NamesOffset + 4,
-			Classes: persistenceBlobHeader.ClassesOffset + 4,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		baseObject, err := readPersistenceBlobObject(persistenceReader, &persistenceTables)
-		if err != nil {
-			return nil, err
-		}
-
-		flag, err := memory.ReadInt[uint8](persistenceReader)
-		if err != nil {
-			return nil, err
-		}
-
-		objectCount, err := memory.ReadInt[uint32](persistenceReader)
-		if err != nil {
-			return nil, err
-		}
-
-		objects := make([]PersistenceBlobObject, objectCount)
-		objects = append(objects, baseObject)
-		for i := 0; i < int(objectCount); i++ {
-			object, err := readPersistenceBlobObject(persistenceReader, &persistenceTables)
+		if saveData.SaveGameClassPath.Path == REMNANT_SAVE_GAME_PROFILE {
+			archive, err := readSaveData(persistenceReader, true, false)
 			if err != nil {
 				return nil, err
 			}
-			objects[i] = object
+
+			return PersistenceBlob{
+				Archive: archive,
+			}, nil
 		}
 
-		err = readClassAdditionalData(persistenceReader, &persistenceTables)
+		version, err := memory.ReadInt[uint32](persistenceReader)
 		if err != nil {
 			return nil, err
 		}
 
-		return PersistenceBlob{
-			Size:        persistenceBlobHeader.Size,
-			NamesOffset: persistenceBlobHeader.NamesOffset,
-			ClassOffset: persistenceBlobHeader.ClassesOffset,
-			BaseObject:  baseObject,
-			Flag:        flag,
-			ObjectCount: objectCount,
-			Objects:     objects,
+		indexOffset, err := memory.ReadInt[uint32](persistenceReader)
+		if err != nil {
+			return nil, err
+		}
+
+		dynamicOffset, err := memory.ReadInt[uint32](persistenceReader)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = persistenceReader.Seek(int64(indexOffset), io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+
+		infoCount, err := memory.ReadInt[uint32](persistenceReader)
+		if err != nil {
+			return nil, err
+		}
+
+		actorInfo := make([]ue.FInfo, infoCount)
+		for i := uint32(0); i < infoCount; i++ {
+			actorInfo[i], err = ue.ReadFInfo(persistenceReader)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		destroyedCount, err := memory.ReadInt[uint32](persistenceReader)
+		if err != nil {
+			return nil, err
+		}
+
+		destroyed := make([]uint64, destroyedCount)
+		for i := uint32(0); i < destroyedCount; i++ {
+			destroyed[i], err = memory.ReadInt[uint64](persistenceReader)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		actors := make(map[uint64]Actor)
+		for _, info := range actorInfo {
+			_, err = persistenceReader.Seek(int64(info.Offset), io.SeekStart)
+			if err != nil {
+				return nil, err
+			}
+
+			actorBytes := make([]byte, info.Size)
+			_, err = persistenceReader.Read(actorBytes)
+			if err != nil {
+				return nil, err
+			}
+
+			actorReader := bytes.NewReader(actorBytes)
+
+			actors[info.UniqueID], err = readActor(actorReader)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		_, err = persistenceReader.Seek(int64(dynamicOffset), io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+
+		dynamicCount, err := memory.ReadInt[uint32](persistenceReader)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := uint32(0); i < dynamicCount; i++ {
+			dynamicActor, err := readDynamicActor(persistenceReader)
+			if err != nil {
+				return nil, err
+			}
+
+			actor := actors[dynamicActor.UniqueID]
+			actor.DynamicData = dynamicActor
+			actors[dynamicActor.UniqueID] = actor
+		}
+
+		return PersistenceContainer{
+			Version:   version,
+			Destroyed: destroyed,
+			Actors:    actors,
 		}, nil
 	}
 	if structName == "Guid" {
-		var guidData GuidData
-		err := binary.Read(r, binary.LittleEndian, &guidData)
+		guid, err := ue.ReadGuid(r)
 		if err != nil {
 			return nil, err
 		}
-		return guidData, nil
+		return guid, nil
 	}
 	if structName == "Vector" {
-		var vector Vector
-		err := binary.Read(r, binary.LittleEndian, &vector)
-		if err != nil {
-			return nil, err
-		}
-		return vector, nil
+		return ue.ReadFVector(r)
+	}
+	if structName == "DateTime" {
+		return memory.ReadInt[int64](r)
 	}
 
-	return readProperties(r, tables)
+	return readProperties(r, saveData)
 }
 
-func readPersistenceContainer(bytesData []byte) (interface{}, error) {
-	persistenceContainer := PersistenceContainer{
-		Header: PersistenceContainerHeader{
-			Version:       binary.LittleEndian.Uint32(bytesData[4:8]),
-			IndexOffset:   binary.LittleEndian.Uint32(bytesData[8:12]),
-			DynamicOffset: binary.LittleEndian.Uint32(bytesData[12:16]),
-		},
-		Info: []PersistenceInfo{},
+func readArrayStructHeader(r io.ReadSeeker, saveData *SaveData) (ArrayStructProperty, error) {
+	// skip first 2 bytes - variable name again
+	_, err := r.Seek(2, io.SeekCurrent)
+	if err != nil {
+		return ArrayStructProperty{}, err
 	}
 
-	r := bytes.NewReader(bytesData)
-	_, err := r.Seek(int64(persistenceContainer.Header.IndexOffset+4), io.SeekStart)
+	// skip 2 more bytes - type again (StructProperty)
+	_, err = r.Seek(2, io.SeekCurrent)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	// skip 4 bytes (array size in bytes)
+	size, err := memory.ReadInt[uint32](r)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	// skip 4 bytes - index
+	_, err = r.Seek(4, io.SeekCurrent)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	elementType, err := readName(r, saveData)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	guid, err := ue.ReadGuid(r)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	_, err = r.Seek(1, io.SeekCurrent)
+	if err != nil {
+		return ArrayStructProperty{}, err
+	}
+
+	return ArrayStructProperty{
+		ElementType: elementType,
+		GUID:        guid,
+		Size:        size,
+	}, nil
+}
+
+func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, saveData *SaveData, raw bool) (interface{}, error) {
+	switch varType {
+	case "IntProperty":
+		{
+			return readNumProperty[int32](r, raw)
+		}
+	case "Int16Property":
+		{
+			return readNumProperty[int16](r, raw)
+		}
+	case "Int64Property":
+		{
+			return readNumProperty[int64](r, raw)
+		}
+	case "UInt64Property":
+		{
+			return readNumProperty[uint64](r, raw)
+		}
+	case "FloatProperty":
+		{
+			return readNumProperty[float32](r, raw)
+		}
+	case "DoubleProperty":
+		{
+			return readNumProperty[float64](r, raw)
+		}
+	case "UInt16Property":
+		{
+			return readNumProperty[uint16](r, raw)
+		}
+	case "UInt32Property":
+		{
+			return readNumProperty[uint32](r, raw)
+		}
+	case "SoftClassPath":
+		{
+			if !raw {
+				_, err := r.Seek(1, io.SeekCurrent)
+				if err != nil {
+					return "", err
+				}
+			}
+			return ue.ReadFString(r)
+		}
+	case "SoftObjectProperty":
+		{
+			if !raw {
+				_, err := r.Seek(1, io.SeekCurrent)
+				if err != nil {
+					return "", err
+				}
+			}
+			return ue.ReadFString(r)
+		}
+	case "BoolProperty":
+		{
+			return readBoolProperty(r, raw)
+		}
+	case "MapProperty":
+		{
+			if raw {
+				log.Fatal("Raw map property is not supported yet")
+			}
+			return readMapProperty(r, saveData)
+		}
+	case "EnumProperty":
+		{
+			return readEnumProperty(r, saveData)
+		}
+	case "StrProperty":
+		{
+			return readStrProperty(r, raw)
+		}
+	case "TextProperty":
+		{
+			return readTextProperty(r, raw)
+		}
+	case "NameProperty":
+		{
+			return readNameProperty(r, saveData, raw)
+		}
+	case "ArrayProperty":
+		{
+			elementsType, err := readName(r, saveData)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = r.Seek(1, io.SeekCurrent)
+			if err != nil {
+				return nil, err
+			}
+
+			arrayLength, err := memory.ReadInt[uint32](r)
+			if err != nil {
+				return nil, err
+			}
+
+			if elementsType == "StructProperty" {
+				arrayStructProperty, err := readArrayStructHeader(r, saveData)
+				if err != nil {
+					return nil, err
+				}
+
+				items := make([]StructProperty, arrayLength)
+				for i := 0; i < int(arrayLength); i++ {
+					value, err := readStructPropertyData(r, arrayStructProperty.ElementType, saveData)
+					if err != nil {
+						return nil, err
+					}
+					items[i] = StructProperty{
+						Name:  arrayStructProperty.ElementType,
+						Value: value,
+						GUID:  arrayStructProperty.GUID,
+						Size:  varSize,
+					}
+
+				}
+				arrayStructProperty.Items = items
+				return arrayStructProperty, nil
+			}
+
+			result := ArrayProperty{
+				ElementType: elementsType,
+				Count:       arrayLength,
+				Items:       make([]interface{}, arrayLength),
+			}
+			for i := 0; i < int(arrayLength); i++ {
+				elementValue, err := getPropertyValue(r, elementsType, varSize, saveData, true)
+				if err != nil {
+					return nil, err
+				}
+				result.Items[i] = elementValue
+			}
+
+			return result, nil
+		}
+	case "StructProperty":
+		{
+			if raw {
+				// not sure about it
+				guid, err := ue.ReadGuid(r)
+				if err != nil {
+					return nil, err
+				}
+
+				return StructReference{
+					GUID: guid,
+				}, nil
+			}
+
+			structName, err := readName(r, saveData)
+			if err != nil {
+				return nil, err
+			}
+
+			// 17 bytes, 16 GUID + padding?
+			guid, err := ue.ReadGuid(r)
+			if err != nil {
+				return nil, err
+			}
+			_, err = r.Seek(1, io.SeekCurrent)
+			if err != nil {
+				return nil, err
+			}
+
+			result, err := readStructPropertyData(r, structName, saveData)
+			if err != nil {
+				return nil, err
+			}
+
+			return StructProperty{
+				Name:  structName,
+				GUID:  guid,
+				Value: result,
+				Size:  varSize,
+			}, nil
+		}
+	case "ObjectProperty":
+		{
+			return readObjectProperty(r, saveData, raw)
+		}
+	case "ByteProperty":
+		{
+			return readByteProperty(r, saveData, raw)
+		}
+	default:
+		{
+			log.Fatal("Raw map property is not supported yet")
+		}
+	}
+
+	return nil, nil
+}
+
+func readProperty(r io.ReadSeeker, saveData *SaveData) (*Property, error) {
+	variableName, err := readName(r, saveData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read variable name index: %w", err)
+	}
+
+	if variableName == "None" {
+		return nil, nil
+	}
+
+	varType, err := readName(r, saveData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read variable type index: %w", err)
+	}
+
+	varSize, err := memory.ReadInt[uint32](r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read variable size: %w", err)
+	}
+
+	index, err := memory.ReadInt[uint32](r)
 	if err != nil {
 		return nil, err
 	}
 
-	numInfos, err := memory.ReadInt[int32](r)
+	value, err := getPropertyValue(r, varType, varSize, saveData, false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read variable data (%s %s %d): %w", variableName, varType, varSize, err)
 	}
 
-	persistenceContainer.Info = make([]PersistenceInfo, numInfos)
+	return &Property{
+		Name:  variableName,
+		Type:  varType,
+		Index: index,
+		Size:  varSize,
+		Value: value,
+	}, nil
+}
 
-	for i := 0; i < int(numInfos); i++ {
-		persistenceContainer.Info[i] = PersistenceInfo{}
-		persistenceContainer.Info[i].UniqueID, err = memory.ReadInt[uint64](r)
+func readProperties(r io.ReadSeeker, saveData *SaveData) ([]Property, error) {
+	result := []Property{}
+	for {
+		property, err := readProperty(r, saveData)
 		if err != nil {
 			return nil, err
 		}
-		// if version < 2 { // in our case version is 4, so this code is basically unreachable
-		// 	_, err = ue.ReadFString(r) // or readFName if this wont work
-		// 	if err != nil {
-		// 		return nil, err
-		// 	}
-		// }
-		persistenceContainer.Info[i].Offset, err = memory.ReadInt[uint32](r)
-		if err != nil {
-			return nil, err
+		if property == nil {
+			break
 		}
-		persistenceContainer.Info[i].Length, err = memory.ReadInt[uint32](r)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	result := []PersistenceResult{}
-	for i := 0; i < len(persistenceContainer.Info); i++ {
-		from := persistenceContainer.Info[i].Offset + 4
-		to := from + persistenceContainer.Info[i].Length
-		persistenceContainerReader := bytes.NewReader(bytesData[from:to])
-
-		_, err = persistenceContainerReader.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		offsets, err := readOffsets(persistenceContainerReader)
-		if err != nil {
-			return nil, err
-		}
-
-		tables, err := readTables(persistenceContainerReader, offsets)
-		if err != nil {
-			return nil, err
-		}
-
-		// skip 4 bytes
-		// version, err = memory.ReadInt[int32](r) // version
-		_, err = persistenceContainerReader.Seek(4, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-
-		persistenceData, err := readProperties(persistenceContainerReader, &tables)
-		if err != nil {
-			return nil, err
-		}
-
-		result = append(result, PersistenceResult{
-			ID:       int32(i),
-			UniqueID: persistenceContainer.Info[i].UniqueID,
-			Data:     persistenceData,
-		})
-	}
-
-	numDestroyed, err := memory.ReadInt[int32](r)
-	if err != nil {
-		return nil, err
-	}
-
-	destroyed := make([]uint64, numDestroyed)
-	for i := 0; i < int(numDestroyed); i++ {
-		destroyed[i], err = memory.ReadInt[uint64](r)
-		if err != nil {
-			return nil, err
-		}
-		// if version < 2 { // in our case version is 4, so this code is basically unreachable
-		// 	_, err = ue.ReadFString(r)
-		// 	if err != nil {
-		// 		return nil, err
-		// 	}
-		// }
+		result = append(result, *property)
 	}
 
 	return result, nil
