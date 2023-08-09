@@ -86,9 +86,9 @@ type PersistenceContainer struct {
 }
 
 type Actor struct {
-	Transform   ue.FTransform
+	Transform   *ue.FTransform
 	Archive     SaveData
-	DynamicData DynamicActor
+	DynamicData *DynamicActor
 }
 
 func readActor(r io.ReadSeeker) (Actor, error) {
@@ -111,14 +111,14 @@ func readActor(r io.ReadSeeker) (Actor, error) {
 	}
 
 	return Actor{
-		Transform: transform,
+		Transform: &transform,
 		Archive:   archive,
 	}, nil
 }
 
 type DynamicActor struct {
 	UniqueID  uint64
-	Transform ue.FTransform
+	Transform *ue.FTransform
 	ClassPath ue.FTopLevelAssetPath
 }
 
@@ -140,7 +140,7 @@ func readDynamicActor(r io.Reader) (DynamicActor, error) {
 
 	return DynamicActor{
 		UniqueID:  uniqueID,
-		Transform: transform,
+		Transform: &transform,
 		ClassPath: classPath,
 	}, nil
 }
@@ -539,7 +539,7 @@ func readStructPropertyData(r io.ReadSeeker, structName string, saveData *SaveDa
 			}
 
 			actor := actors[dynamicActor.UniqueID]
-			actor.DynamicData = dynamicActor
+			actor.DynamicData = &dynamicActor
 			actors[dynamicActor.UniqueID] = actor
 		}
 

@@ -19,7 +19,7 @@ type UObject struct {
 	ObjectID   uint32
 	WasLoaded  bool
 	ObjectPath string
-	LoadedData UObjectLoadedData
+	LoadedData *UObjectLoadedData
 	Properties []Property
 	Components []Component
 }
@@ -208,7 +208,7 @@ func readObject(r io.Reader, saveData *SaveData, objectID uint32) (UObject, erro
 		ObjectID:   objectID,
 		WasLoaded:  wasLoaded,
 		ObjectPath: objectPath,
-		LoadedData: loadedData,
+		LoadedData: &loadedData,
 		Properties: make([]Property, 0),
 		Components: nil,
 	}, nil
@@ -356,7 +356,10 @@ func readObjectData(r io.ReadSeeker, object *UObject, saveData *SaveData) error 
 		}
 
 		if currentPos-startPos != int64(length) {
-			log.Println("Did not read all object data", currentPos-startPos, length)
+			log.Println(
+				"Did not read all object data", currentPos-startPos, length,
+				"at", startPos, "for", object.ObjectPath,
+			)
 			_, err = r.Seek(startPos+int64(length), io.SeekStart)
 			if err != nil {
 				return err
