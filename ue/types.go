@@ -1,6 +1,7 @@
 package ue
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"revision-go/memory"
@@ -24,7 +25,7 @@ func ReadFString(r io.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(stringData[:stringSize-1]), nil
+	return string(bytes.Trim(stringData, "\x00")), nil
 }
 
 type FName struct {

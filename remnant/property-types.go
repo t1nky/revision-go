@@ -716,6 +716,7 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, saveData 
 				if err != nil {
 					return nil, err
 				}
+				arrayStructProperty.Count = arrayLength
 
 				items := make([]StructProperty, arrayLength)
 				for i := 0; i < int(arrayLength); i++ {
@@ -809,12 +810,12 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, saveData 
 }
 
 func readProperty(r io.ReadSeeker, saveData *SaveData) (*Property, error) {
-	variableName, err := readName(r, saveData)
+	varName, err := readName(r, saveData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read variable name index: %w", err)
 	}
 
-	if variableName == "None" {
+	if varName == "None" {
 		return nil, nil
 	}
 
@@ -833,13 +834,22 @@ func readProperty(r io.ReadSeeker, saveData *SaveData) (*Property, error) {
 		return nil, err
 	}
 
-	value, err := getPropertyValue(r, varType, varSize, saveData, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read variable data (%s %s %d): %w", variableName, varType, varSize, err)
+	var value interface{}
+	if varName == "FowVisitedCoordinates" {
+		value = make([]byte, varSize+19)
+		_, err := r.Read(value.([]byte))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		value, err = getPropertyValue(r, varType, varSize, saveData, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read variable data (%s %s %d): %w", varName, varType, varSize, err)
+		}
 	}
 
 	return &Property{
-		Name:  variableName,
+		Name:  varName,
 		Type:  varType,
 		Index: index,
 		Size:  varSize,
