@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+concurrency: production
 
 jobs:
   build:
@@ -15,14 +16,14 @@ jobs:
       - name: Tag the repository
         id: tag
         run: |
-          # See https://docs.github.com/en/get-started/using-git/dealing-with-special-characters-in-branch-and-tag-names
-          TAG=v$(date -Iseconds | sed 's/[T:\+]/-/g')
-          echo "$TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          DATE_TAG=$(date +v%Y%m%d)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          FULL_TAG="${DATE_TAG}_${COMMIT_HASH}"
+          echo "tag=$FULL_TAG" >> $GITHUB_OUTPUT
           git config user.name "GitHub Actions"
           git config user.email "github-actions@github.com"
-          git tag -a $TAG -m "Published version $TAG" ${GITHUB_SHA}
-          git push origin $TAG
+          git tag -a $FULL_TAG -m "Published version $FULL_TAG" ${GITHUB_SHA}
+          git push origin $FULL_TAG
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -30,10 +31,10 @@ jobs:
           go-version: "1.20"
 
       - name: Build
-        run: env GOOS=windows GOARCH=amd64 go build -v ./...
+        run: GOOS=windows GOARCH=amd64 go build -v -o revision.exe .
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          files: revision-go.exe
+          files: revision.exe
