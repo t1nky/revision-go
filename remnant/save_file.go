@@ -145,7 +145,10 @@ func decompressChunks(saveFile *SaveFile) ([]byte, error) {
 	}
 
 	data := result.Bytes()
+
 	binary.LittleEndian.PutUint32(data[8:], saveFile.Version)
+
+	// crc32.Checksum(data, crc32.MakeTable(0xedb88320))
 
 	return data, nil
 }

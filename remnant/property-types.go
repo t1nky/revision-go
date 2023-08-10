@@ -791,6 +791,9 @@ func getPropertyValue(r io.ReadSeeker, varType string, varSize uint32, saveData 
 	case "ByteProperty":
 		return readByteProperty(r, saveData, raw)
 
+	case "None":
+		return nil, nil
+
 	default:
 		return nil, fmt.Errorf("property type is not supported yet: %s", varType)
 	}
