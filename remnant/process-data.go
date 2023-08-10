@@ -73,7 +73,7 @@ type SaveArchive struct {
 	Data   SaveData
 }
 
-func readHeader(r io.Reader) (SaveHeader, error) {
+func readSaveHeader(r io.Reader) (SaveHeader, error) {
 	dataHeader := SaveHeader{}
 
 	err := binary.Read(r, binary.LittleEndian, &dataHeader)
@@ -142,7 +142,7 @@ func readSaveData(r io.ReadSeeker, hasPackageVersion bool, hasTopLevelAssetPath 
 }
 
 func ReadSaveArchive(r io.ReadSeeker) (SaveArchive, error) {
-	header, err := readHeader(r)
+	header, err := readSaveHeader(r)
 	if err != nil {
 		return SaveArchive{}, err
 	}
