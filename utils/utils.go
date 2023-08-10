@@ -2,7 +2,6 @@ package utils
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -11,11 +10,8 @@ import (
 
 func createIfNotExist(name string) error {
 	_, err := os.Stat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		err := os.Mkdir(name, os.ModePerm)
-		if err != nil {
-			return err
-		}
+	if err != nil && os.IsNotExist(err) {
+		return os.Mkdir(name, os.ModePerm)
 	}
 	return err
 }

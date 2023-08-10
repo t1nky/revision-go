@@ -267,7 +267,7 @@ func readStrProperty(r io.ReadSeeker, raw bool) (string, error) {
 		return "", fmt.Errorf("readStrProperty: %w", err)
 	}
 
-	return string(strData), nil
+	return string(bytes.Trim(strData, "\x00")), nil
 }
 
 func readNameProperty(r io.ReadSeeker, saveData *SaveData, raw bool) (string, error) {

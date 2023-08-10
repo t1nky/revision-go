@@ -145,7 +145,7 @@ func decompressChunks(saveFile *SaveFile) ([]byte, error) {
 	}
 
 	data := result.Bytes()
-	binary.LittleEndian.PutUint32(data[8:], uint32(saveFile.Version))
+	binary.LittleEndian.PutUint32(data[8:], saveFile.Version)
 
 	return data, nil
 }
