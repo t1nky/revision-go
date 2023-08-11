@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 )
@@ -17,7 +18,7 @@ type CompressedChunkHeader struct {
 	CompressedSize              uint64
 
 	LoadingCompressionChunkSize2 uint64
-	Size2                        uint64
+	CompressedSize2              uint64
 	LoadingCompressionChunkSize3 uint64
 }
 
@@ -38,6 +39,9 @@ const (
 	PACKAGE_FILE_TAG_SWAPPED       = 0xC1832A9E
 	ARCHIVE_V2_HEADER_TAG          = PACKAGE_FILE_TAG | (uint64(0x22222222) << 32)
 	LOADING_COMPRESSION_CHUNK_SIZE = 131072
+)
+const (
+	CompressorZlib = 3
 )
 
 func decompressData(data []byte) ([]byte, error) {
@@ -72,8 +76,8 @@ func readSave(filePath string) (*SaveFile, error) {
 	}
 	defer file.Close()
 
-	var crc32 uint32
-	err = binary.Read(file, binary.LittleEndian, &crc32)
+	var dataCrc32 uint32
+	err = binary.Read(file, binary.LittleEndian, &dataCrc32)
 	if err != nil {
 		return nil, err
 	}
@@ -90,6 +94,10 @@ func readSave(filePath string) (*SaveFile, error) {
 		return nil, err
 	}
 
+	if version < 8 {
+		return nil, fmt.Errorf("unsupported save file version")
+	}
+
 	chunks := []CompressedSaveChunk{}
 
 	for {
@@ -100,6 +108,12 @@ func readSave(filePath string) (*SaveFile, error) {
 		}
 		if err != nil {
 			return nil, err
+		}
+		if compressedChunkHeader.PackageFileTag != ARCHIVE_V2_HEADER_TAG {
+			return nil, fmt.Errorf("invalid package file tag")
+		}
+		if compressedChunkHeader.Compressor != CompressorZlib {
+			return nil, fmt.Errorf("unsupported compressor")
 		}
 
 		data := make([]byte, compressedChunkHeader.CompressedSize)
@@ -115,7 +129,7 @@ func readSave(filePath string) (*SaveFile, error) {
 	}
 
 	return &SaveFile{
-		Crc32:       crc32,
+		Crc32:       dataCrc32,
 		ContentSize: contentSize,
 		Version:     version,
 		Chunks:      chunks,
@@ -148,7 +162,9 @@ func decompressChunks(saveFile *SaveFile) ([]byte, error) {
 
 	binary.LittleEndian.PutUint32(data[8:], saveFile.Version)
 
-	// crc32.Checksum(data, crc32.MakeTable(0xedb88320))
+	if crc32.Checksum(data[4:], crc32.MakeTable(crc32.IEEE)) != saveFile.Crc32 {
+		return nil, fmt.Errorf("crc32 mismatch")
+	}
 
 	return data, nil
 }
