@@ -56,8 +56,8 @@ type SaveData struct {
 	SaveGameClassPath *ue.FTopLevelAssetPath
 	NameTableOffset   uint64
 	NamesTable        []string
-	ObjectIndexOffset uint64
-	ObjectIndex       []UObject
+	ObjectsOffset     uint64
+	Objects           []UObject
 	Version           uint32
 }
 
@@ -141,7 +141,7 @@ func readSaveData(r io.ReadSeeker, hasPackageVersion bool, hasTopLevelAssetPath 
 	}
 
 	result.NameTableOffset = offsets.Names
-	result.ObjectIndexOffset = offsets.Objects
+	result.ObjectsOffset = offsets.Objects
 	result.Version = offsets.Version
 
 	result.NamesTable, err = readNamesTable(r, offsets.Names)
@@ -379,9 +379,9 @@ func readObjects(r io.ReadSeeker, objectsTableOffset uint64, objectsDataOffset i
 		return fmt.Errorf("failed to read numUniqueClasses: %w", err)
 	}
 
-	saveData.ObjectIndex = make([]UObject, numUniqueObjects)
+	saveData.Objects = make([]UObject, numUniqueObjects)
 	for i := 0; i < int(numUniqueObjects); i++ {
-		saveData.ObjectIndex[i], err = readObject(r, saveData, uint32(i))
+		saveData.Objects[i], err = readObject(r, saveData, uint32(i))
 		if err != nil {
 			return fmt.Errorf("failed to read object %d: %w", i, err)
 		}
@@ -397,13 +397,13 @@ func readObjects(r io.ReadSeeker, objectsTableOffset uint64, objectsDataOffset i
 		if err != nil {
 			return fmt.Errorf("failed to read object id: %w", err)
 		}
-		object := saveData.ObjectIndex[objectID]
+		object := saveData.Objects[objectID]
 
 		err = readObjectData(r, &object, saveData)
 		if err != nil {
 			return fmt.Errorf("failed to read object data: %w", err)
 		}
-		saveData.ObjectIndex[objectID] = object
+		saveData.Objects[objectID] = object
 
 		isActor, err := memory.ReadInt[uint8](r)
 		if err != nil {
@@ -415,7 +415,7 @@ func readObjects(r io.ReadSeeker, objectsTableOffset uint64, objectsDataOffset i
 				return fmt.Errorf("failed to read components: %w", err)
 			}
 		}
-		saveData.ObjectIndex[objectID] = object
+		saveData.Objects[objectID] = object
 	}
 
 	return nil

@@ -45,7 +45,7 @@ func readObjectProperty(r io.ReadSeeker, saveData *SaveData, raw bool) (ObjectPr
 	}
 
 	return ObjectProperty{
-		ClassName: saveData.ObjectIndex[objectIndex].ObjectPath,
+		ClassName: saveData.Objects[objectIndex].ObjectPath,
 	}, nil
 }
 

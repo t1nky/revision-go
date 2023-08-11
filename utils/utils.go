@@ -37,17 +37,15 @@ func saveBinary(foldername string, name string, data []byte) error {
 func SaveToFile(foldername string, name string, dataType string, data interface{}) error {
 	switch dataType {
 	case "json":
-		if config.DEBUG_SAVE_JSON {
-			err := createIfNotExist("json")
-			if err != nil {
-				return err
-			}
-			jsonObject, err := json.MarshalIndent(data, "", "  ")
-			if err != nil {
-				return err
-			}
-			return saveJSON(foldername, name, jsonObject)
+		err := createIfNotExist("json")
+		if err != nil {
+			return err
 		}
+		jsonObject, err := json.MarshalIndent(data, "", "  ")
+		if err != nil {
+			return err
+		}
+		return saveJSON(foldername, name, jsonObject)
 	case "bin":
 		if config.DEBUG_SAVE_BINARY {
 			err := createIfNotExist("binary")
