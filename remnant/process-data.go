@@ -25,7 +25,7 @@ type UObject struct {
 }
 
 type UObjectLoadedData struct {
-	Name    ue.FName
+	Name    string
 	OuterID uint32
 }
 
@@ -71,6 +71,11 @@ type SaveHeader struct {
 type SaveArchive struct {
 	Header SaveHeader
 	Data   SaveData
+}
+
+type Variables struct {
+	Name       string
+	Properties []Property
 }
 
 const (
@@ -201,12 +206,9 @@ func readObject(r io.Reader, saveData *SaveData, objectID uint32) (UObject, erro
 
 	var loadedData UObjectLoadedData
 	if !wasLoaded {
-		objectName, err := ue.ReadFName(r)
+		objectName, err := readName(r, saveData)
 		if err != nil {
 			return UObject{}, err
-		}
-		if int(objectName.Index) < len(saveData.NamesTable) {
-			objectName.Value = saveData.NamesTable[objectName.Index]
 		}
 
 		outerID, err := memory.ReadInt[uint32](r)
@@ -254,6 +256,101 @@ func readNamesTable(r io.ReadSeeker, namesTableOffset uint64) ([]string, error) 
 	return names, nil
 }
 
+func readVariable(r io.ReadSeeker, saveData *SaveData) (*Property, error) {
+	name, err := readName(r, saveData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read variable name index: %w", err)
+	}
+
+	if name == "None" {
+		return nil, nil
+	}
+
+	varTypeEnumValue, err := memory.ReadInt[uint8](r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read variable type: %w", err)
+	}
+
+	varType := VarTypeNames[varTypeEnumValue]
+
+	var varValue interface{}
+
+	switch varTypeEnumValue {
+	case VarTypeBool:
+		value, err := memory.ReadInt[uint32](r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read variable value: %w", err)
+		}
+
+		varValue = value != 0
+
+	case VarTypeInt:
+		value, err := memory.ReadInt[uint32](r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read variable value: %w", err)
+		}
+
+		varValue = int32(value)
+
+	case VarTypeFloat:
+		value, err := memory.ReadInt[uint32](r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read variable value: %w", err)
+		}
+
+		varValue = float32(value)
+
+	case VarTypeName:
+		value, err := readName(r, saveData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read variable value: %w", err)
+		}
+
+		varValue = value
+
+	default:
+		return nil, fmt.Errorf("unknown variable type: %d", varTypeEnumValue)
+	}
+
+	return &Property{
+		Name:  name,
+		Type:  varType,
+		Value: varValue,
+	}, nil
+}
+
+func readVariables(r io.ReadSeeker, saveData *SaveData) (Variables, error) {
+	name, err := readName(r, saveData)
+	if err != nil {
+		return Variables{}, fmt.Errorf("failed to read variable name index: %w", err)
+	}
+
+	_, err = memory.ReadInt[uint64](r)
+	if err != nil {
+		return Variables{}, fmt.Errorf("failed to read empty value: %w", err)
+	}
+
+	arrayLength, err := memory.ReadInt[uint32](r)
+	if err != nil {
+		return Variables{}, fmt.Errorf("failed to read array length: %w", err)
+	}
+
+	properties := make([]Property, 0, arrayLength)
+
+	for i := 0; i < int(arrayLength); i++ {
+		property, err := readVariable(r, saveData)
+		if err != nil {
+			return Variables{}, fmt.Errorf("failed to read property: %w", err)
+		}
+		properties = append(properties, *property)
+	}
+
+	return Variables{
+		Name:       name,
+		Properties: properties,
+	}, nil
+}
+
 func readComponents(r io.ReadSeeker, saveData *SaveData) ([]Component, error) {
 	componentCount, err := memory.ReadInt[uint32](r)
 	if err != nil {
@@ -279,67 +376,68 @@ func readComponents(r io.ReadSeeker, saveData *SaveData) ([]Component, error) {
 		}
 
 		properties := []Property{}
-		if componentKey == "GlobalVariables" {
-			_, err := r.Seek(10, io.SeekCurrent)
+		switch componentKey {
+		case "GlobalVariables":
+			variables, err := readVariables(r, saveData)
 			if err != nil {
 				return nil, err
 			}
-
-			arrayLength, err := memory.ReadInt[uint32](r)
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		case "Variables":
+			variables, err := readVariables(r, saveData)
 			if err != nil {
 				return nil, err
 			}
-
-			for i := 0; i < int(arrayLength); i++ {
-				varName, err := readName(r, saveData)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read variable name index: %w", err)
-				}
-
-				if varName == "None" {
-					return nil, nil
-				}
-
-				varTypeEnumValue, err := memory.ReadInt[uint8](r)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read variable type: %w", err)
-				}
-
-				varType := VarTypeNames[varTypeEnumValue]
-
-				value, err := memory.ReadInt[uint32](r)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read variable value: %w", err)
-				}
-
-				var varValue interface{}
-				switch varTypeEnumValue {
-				case VarTypeBool:
-					varValue = value != 0
-
-				case VarTypeInt:
-					varValue = int32(value)
-
-				case VarTypeFloat:
-					varValue = float32(value)
-
-				case VarTypeName:
-					varValue, err = readName(r, saveData)
-					if err != nil {
-						return nil, fmt.Errorf("failed to read variable value: %w", err)
-					}
-
-				default:
-					return nil, fmt.Errorf("unknown variable type: %d", varTypeEnumValue)
-				}
-
-				properties = append(properties, Property{
-					Name:  varName,
-					Type:  varType,
-					Value: varValue,
-				})
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		case "Variable":
+			variables, err := readVariables(r, saveData)
+			if err != nil {
+				return nil, err
 			}
-		} else {
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		case "PersistenceKeys":
+			variables, err := readVariables(r, saveData)
+			if err != nil {
+				return nil, err
+			}
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		case "PersistanceKeys1":
+			variables, err := readVariables(r, saveData)
+			if err != nil {
+				return nil, err
+			}
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		case "PersistenceKeys1":
+			variables, err := readVariables(r, saveData)
+			if err != nil {
+				return nil, err
+			}
+			properties = append(properties, Property{
+				Name:  componentKey,
+				Type:  componentKey,
+				Value: variables,
+			})
+		default:
 			properties, err = readProperties(r, saveData)
 			if err != nil {
 				return nil, err
@@ -351,12 +449,16 @@ func readComponents(r io.ReadSeeker, saveData *SaveData) ([]Component, error) {
 			return nil, err
 		}
 
-		if currentPos-startPos < int64(objectLength)-4 { // if did not read at least 4 bytes
-			log.Printf("Did not read all component data %d/%d at %d for %s\n", currentPos-startPos, objectLength, startPos, componentKey)
-		}
-
-		if _, err := r.Seek(startPos+int64(objectLength), io.SeekStart); err != nil {
-			return nil, err
+		if currentPos-startPos != int64(objectLength) {
+			bytes := make([]byte, startPos+int64(objectLength)-currentPos)
+			_, err := r.Read(bytes)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf(
+				"Did not read all component data. %d/%d bytes read at %d for %s (%v)\n",
+				currentPos-startPos, objectLength, startPos, componentKey, bytes,
+			)
 		}
 
 		components[i] = Component{
@@ -443,15 +545,16 @@ func readObjectData(r io.ReadSeeker, object *UObject, saveData *SaveData) error 
 			return err
 		}
 
-		if currentPos-startPos < int64(length)-4 { // did not read at least 4 bytes
+		if currentPos-startPos != int64(length) {
+			bytes := make([]byte, startPos+int64(length)-currentPos)
+			_, err = r.Read(bytes)
+			if err != nil {
+				return err
+			}
 			log.Printf(
-				"Did not read all object data %d/%d at %d for %s\n", currentPos-startPos, length,
-				startPos, object.ObjectPath,
+				"Did not read all object data. %d/%d bytes read at %d for %s (%v)\n",
+				currentPos-startPos, length, startPos, object.ObjectPath, bytes,
 			)
-		}
-		_, err = r.Seek(startPos+int64(length), io.SeekStart)
-		if err != nil {
-			return err
 		}
 
 		object.Properties = properties
